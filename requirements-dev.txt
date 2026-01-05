@@ -2,7 +2,7 @@
 pytest
 pytest-cov
 pytest-mock
-pytest-azure-functions
+azure-functions
 
 # Code Quality
 black
