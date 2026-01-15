@@ -1,13 +1,12 @@
 name: Deploy to Development
 
 on:
-  # Run automatically after either workflow finishes, but we will gate on BOTH passing for same SHA
+  # Run after either workflow completes, but we gate on BOTH passing for same SHA
   workflow_run:
     workflows: ["Test and Validate", "Security Scan"]
     branches: [develop]
     types: [completed]
 
-  # Manual trigger for controlled deploys (hotfix / rerun)
   workflow_dispatch: {}
 
 permissions:
@@ -16,7 +15,8 @@ permissions:
   id-token: write
 
 concurrency:
-  group: deploy-dev-${{ github.ref }}
+  # workflow_run doesn't always populate github.ref as expected; use branch-safe grouping
+  group: deploy-dev-develop
   cancel-in-progress: false
 
 jobs:
@@ -29,6 +29,8 @@ jobs:
     environment: development
 
     outputs:
+      deploy_sha: ${{ steps.sha.outputs.SHA }}
+      deploy_ref: ${{ steps.sha.outputs.REF }}
       resource_group: ${{ steps.infra.outputs.RESOURCE_GROUP }}
       function_app: ${{ steps.infra.outputs.FUNCTION_APP }}
       app_config: ${{ steps.infra.outputs.APP_CONFIG }}
@@ -65,14 +67,11 @@ jobs:
           set -euo pipefail
           echo "Verifying workflow success for SHA: $SHA"
 
-          # jq is available on ubuntu-latest, but installing explicitly is safe
-          sudo apt-get update -y
-          sudo apt-get install -y jq
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y jq >/dev/null
 
-          # Ensure gh is available
           gh --version
 
-          # Get recent workflow runs on develop and filter by SHA + workflow name
           RUNS=$(gh api \
             -H "Accept: application/vnd.github+json" \
             "/repos/${{ github.repository }}/actions/runs?branch=develop&per_page=50")
@@ -95,9 +94,7 @@ jobs:
           echo "Security Scan conclusion:      $SEC_OK"
 
           if [ "$TEST_OK" != "success" ] || [ "$SEC_OK" != "success" ]; then
-            echo ""
             echo "❌ Prerequisites not met for SHA $SHA"
-            echo "Expected both workflows to be success."
             exit 1
           fi
 
@@ -170,35 +167,45 @@ jobs:
     needs: verify-prereqs-and-infra
 
     steps:
-      - name: Checkout code
+      - name: Checkout code (exact SHA)
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-prereqs-and-infra.outputs.deploy_sha }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      - name: Build Azure Functions ZIP package
+      - name: Build Azure Functions ZIP package (Python v2 layout)
         shell: bash
         run: |
           set -euo pipefail
-          echo "=== Building Azure Functions Package ==="
+          echo "=== Building Azure Functions Package (Python v2) ==="
 
           DEPLOY_DIR="deploy-dev"
           rm -rf "$DEPLOY_DIR"
           mkdir -p "$DEPLOY_DIR"
 
-          # Adjust to your actual structure (tests reference function_app/)
-          if [ -d "function_app" ]; then
-            cp -r function_app/ "$DEPLOY_DIR/"
-          elif [ -d "src" ]; then
-            cp -r src/ "$DEPLOY_DIR/"
+          # Root files required by Functions runtime
+          cp host.json "$DEPLOY_DIR/"
+          cp requirements.txt "$DEPLOY_DIR/" 2>/dev/null || echo "No requirements.txt found"
+
+          # IMPORTANT:
+          # You currently have v2 model code in function_app/__init__.py.
+          # For reliable discovery, place it at ZIP root as function_app.py
+          if [ -f "function_app/__init__.py" ]; then
+            cp function_app/__init__.py "$DEPLOY_DIR/function_app.py"
           else
-            find . -maxdepth 1 -name "*.py" -exec cp {} "$DEPLOY_DIR/" \;
+            echo "❌ Expected function_app/__init__.py not found."
+            exit 1
           fi
 
-          cp host.json "$DEPLOY_DIR/" 2>/dev/null || echo "No host.json found"
-          cp requirements.txt "$DEPLOY_DIR/" 2>/dev/null || echo "No requirements.txt found"
+          # Optional: include any shared modules under function_app/ (excluding __init__.py)
+          # This allows you to later split code into multiple files.
+          mkdir -p "$DEPLOY_DIR/function_app"
+          rsync -a --exclude="__init__.py" function_app/ "$DEPLOY_DIR/function_app/" || true
 
           cat > "$DEPLOY_DIR/.funcignore" << 'EOF'
           __pycache__
@@ -216,6 +223,9 @@ jobs:
           (cd "$DEPLOY_DIR" && zip -r ../function-app-dev.zip .)
           echo "✅ Created function-app-dev.zip"
           echo "Size: $(du -h function-app-dev.zip | cut -f1)"
+
+          echo "=== ZIP ROOT CONTENTS ==="
+          unzip -l function-app-dev.zip | head -n 40
 
       - name: Upload Dev Package
         uses: actions/upload-artifact@v4
@@ -247,6 +257,28 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
           audience: api://AzureADTokenExchange
 
+      # Optional but recommended: ensure app settings are correct for Python runtime
+      - name: Ensure Function App runtime settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESOURCE_GROUP="${{ needs.verify-prereqs-and-infra.outputs.resource_group }}"
+          FUNCTION_APP="${{ needs.verify-prereqs-and-infra.outputs.function_app }}"
+
+          echo "Ensuring runtime settings on $FUNCTION_APP ..."
+
+          az functionapp config appsettings set \
+            --name "$FUNCTION_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --settings \
+              FUNCTIONS_WORKER_RUNTIME=python \
+              FUNCTIONS_EXTENSION_VERSION=~4 \
+              WEBSITE_RUN_FROM_PACKAGE=1 \
+              AzureWebJobsFeatureFlags=EnableWorkerIndexing \
+            -o none
+
+          echo "✅ Runtime settings ensured"
+
       - name: Deploy ZIP to Function App
         shell: bash
         run: |
@@ -259,6 +291,7 @@ jobs:
           echo "Target:"
           echo "  Resource Group: $RESOURCE_GROUP"
           echo "  Function App:   $FUNCTION_APP"
+          echo "  Deploy SHA:     ${{ needs.verify-prereqs-and-infra.outputs.deploy_sha }}"
           echo "  Run ID:         ${{ github.run_id }}"
 
           az functionapp deployment source config-zip \
@@ -268,66 +301,41 @@ jobs:
 
           echo "✅ Deployment initiated"
 
-      - name: Verify Deployment
+      - name: Verify Functions are indexed (portal visibility check)
         shell: bash
         run: |
           set -euo pipefail
-          echo "=== VERIFYING DEV DEPLOYMENT ==="
-
           RESOURCE_GROUP="${{ needs.verify-prereqs-and-infra.outputs.resource_group }}"
           FUNCTION_APP="${{ needs.verify-prereqs-and-infra.outputs.function_app }}"
 
-          echo "Resource Group: $RESOURCE_GROUP"
-          echo "Function App:   $FUNCTION_APP"
-          echo ""
+          echo "Waiting for indexing..."
+          sleep 40
 
-          echo "Azure account context:"
-          az account show -o table
-          echo ""
-
-          echo "Waiting for deployment to propagate..."
-          sleep 30
-          echo ""
-
-          echo "Fetching Function App JSON..."
-          az functionapp show \
+          echo "Listing functions..."
+          az functionapp function list \
             --name "$FUNCTION_APP" \
             --resource-group "$RESOURCE_GROUP" \
-            -o json > functionapp.json
+            -o table || true
 
-          echo ""
-          echo "Function App key fields:"
-          sudo apt-get update -y >/dev/null
-          sudo apt-get install -y jq >/dev/null
-          jq -r '{name:.name, state:.state, defaultHostName:.defaultHostName, hostNames:.hostNames, enabled:.enabled, kind:.kind, location:.location}' functionapp.json
-          echo ""
+          COUNT=$(az functionapp function list \
+            --name "$FUNCTION_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "length(@)" -o tsv 2>/dev/null || echo "0")
 
-          HOST=$(jq -r '.defaultHostName // empty' functionapp.json | tr -d '\r\n')
-
-          if [ -z "$HOST" ]; then
-            echo "❌ defaultHostName is EMPTY."
-            echo "This usually means one of these:"
-            echo "1) Wrong subscription/tenant context"
-            echo "2) The resource returned is not a Microsoft.Web/sites Function App"
-            echo "3) API returned unexpected shape / permissions issue"
-            echo ""
-            echo "Dumping full JSON (sanitized fields):"
-            jq -r '{id, name, type, kind, location, state, defaultHostName, hostNames, enabled}' functionapp.json
+          echo "Function count: $COUNT"
+          if [ "$COUNT" = "0" ]; then
+            echo "❌ No functions detected after deploy. Likely packaging/runtime issue."
             exit 1
           fi
 
-          echo "✅ Host resolved"
-          echo "URL: https://$HOST"
+          HOST=$(az functionapp show \
+            --name "$FUNCTION_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "defaultHostName" -o tsv)
 
-          echo ""
-          echo "NOTE: Azure Functions often does NOT respond on /"
-          echo "Testing basic HTTPS connectivity to host (will often 404, but should connect)..."
-          if curl -s --max-time 10 -I "https://$HOST" >/dev/null 2>&1; then
-            echo "✅ HTTPS connection established"
-          else
-            echo "⚠️  Could not connect yet (warmup/network/DNS)."
-          fi
-
+          echo "✅ Host: https://$HOST"
+          echo "Note: Your route is /api/http_trigger"
+          echo "Example (Function auth required): https://$HOST/api/http_trigger?name=dev"
 
       - name: Update App Deployment Status in App Config
         shell: bash
@@ -344,7 +352,7 @@ jobs:
             --tags "environment=development" \
                    "deployed_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
                    "run_id=${{ github.run_id }}" \
-                   "commit=${{ github.sha }}" \
+                   "commit=${{ needs.verify-prereqs-and-infra.outputs.deploy_sha }}" \
                    "branch=develop" \
             --auth-mode login \
             --yes
@@ -374,15 +382,17 @@ jobs:
           - Function App: ${{ needs.verify-prereqs-and-infra.outputs.function_app }}
           - App Config: ${{ needs.verify-prereqs-and-infra.outputs.app_config }}
 
+          ## Deploy Source
+          - Deploy SHA: ${{ needs.verify-prereqs-and-infra.outputs.deploy_sha }}
+          - Branch: develop
+
           ## Status
           - Verify prereqs + infra: ${{ needs.verify-prereqs-and-infra.result }}
           - Deploy: ${{ needs.deploy-to-dev.result }}
 
           ## Metadata
           - Run ID: ${{ github.run_id }}
-          - Commit: ${{ github.sha }}
-          - Branch: develop
-          - Completed (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')
+          - Completed (UTC): $(date -u +'%Y-%m-%d %H:%M:%S')
           EOF
 
           cat dev-summary.md
