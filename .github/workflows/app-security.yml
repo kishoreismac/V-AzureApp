@@ -6,11 +6,9 @@ on:
     paths:
       - '**/*.py'
       - '**/*.json'
-      - '**/*.yaml'
       - '**/*.yml'
       - 'requirements.txt'
-      - 'Pipfile'
-      - 'poetry.lock'
+
   pull_request:
     branches: [main, develop]
   schedule:
