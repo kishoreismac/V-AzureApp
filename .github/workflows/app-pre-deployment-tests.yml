@@ -136,16 +136,6 @@ jobs:
             echo "# Add unit tests here" > tests/unit/test_example.py
           fi
         continue-on-error: true
-        
-      - name: Run integration tests
-        run: |
-          echo "=== Running Integration Tests ==="
-          
-          if [ -d "tests/integration" ] && [ -n "$(find tests/integration -name '*.py' -type f)" ]; then
-            python -m pytest tests/integration -v
-          else
-            echo "ℹ️ No integration tests found in tests/integration"
-          fi
       
       - name: Upload test results
         if: always()

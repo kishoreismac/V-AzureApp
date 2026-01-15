@@ -212,9 +212,7 @@ jobs:
                           for issue in bandit.get("results", []):
                               run["results"].append({
                                   "ruleId": issue.get("test_id", "unknown"),
-                                  "message": {
-                                      "text": f"{issue.get('issue_text','')} (Severity: {issue.get('issue_severity','LOW')})"
-                                  },
+                                  "message": {"text": f"{issue.get('issue_text','')} (Severity: {issue.get('issue_severity','LOW')})"},
                                   "level": level_map.get(issue.get("issue_severity", "LOW"), "note"),
                                   "locations": [{
                                       "physicalLocation": {
@@ -231,21 +229,20 @@ jobs:
               except Exception as e:
                   print(f"Bandit processing error: {e}")
 
+          # IMPORTANT: no placeholder "result" without locations
           if not sarif["runs"]:
               sarif["runs"] = [{
                   "tool": {"driver": {"name": "Security Scan", "informationUri": "https://github.com"}},
-                  "results": [{
-                      "ruleId": "SCAN_COMPLETED",
-                      "message": {"text": "Security scan completed successfully. No issues found."},
-                      "level": "note"
-                  }]
+                  "results": []
               }]
+              print("ℹ️ No findings; uploading empty SARIF run")
 
           with open("security-results.sarif", "w") as f:
               json.dump(sarif, f, indent=2)
 
           total = sum(len(r.get("results", [])) for r in sarif["runs"])
           print(f"✅ SARIF created with {total} total findings")
+
           EOF
 
           python3 create_sarif.py
