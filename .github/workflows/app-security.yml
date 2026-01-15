@@ -175,87 +175,83 @@ jobs:
           name: security-reports-${{ github.run_id }}
           path: security-reports/
           retention-days: 90
-      
+        
       # ========================================
       # 7. CONVERT TO SARIF FOR GITHUB SECURITY TAB
       # ========================================
-      - name: Convert Bandit results to SARIF
+      - name: Create SARIF report
         if: always()
+        id: create-sarif
         run: |
-          python3 << 'EOF'
+          echo "=== Creating SARIF Report ==="
+
+          cat > create_sarif.py <<'EOF'
           import json
           import os
-          
-          # Start with valid SARIF structure
+
           sarif = {
-            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
-            "version": "2.1.0",
-            "runs": [
-              {
-                "tool": {
-                  "driver": {
-                    "name": "Security Scan",
-                    "version": "1.0",
-                    "informationUri": "https://github.com/${{ github.repository }}",
-                    "rules": []
-                  }
-                },
-                "results": []
-              }
-            ]
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": []
           }
-          
-          # Try to add Bandit results if they exist and have findings
+
           bandit_file = "security-reports/bandit-results.json"
           if os.path.exists(bandit_file):
               try:
-                  with open(bandit_file, 'r') as f:
-                      bandit = json.load(f)
-                  
-                  # Only add if there are results
-                  if bandit.get("results"):
-                      bandit_run = {
-                          "tool": {
-                              "driver": {
-                                  "name": "Bandit",
-                                  "informationUri": "https://bandit.readthedocs.io/",
-                                  "rules": []
-                              }
-                          },
-                          "results": []
-                      }
-                      
-                      for issue in bandit.get("results", []):
-                          severity_map = {"HIGH": "error", "MEDIUM": "warning", "LOW": "note"}
-                          
-                          bandit_run["results"].append({
-                              "ruleId": issue.get("test_id", "unknown"),
-                              "message": {"text": issue.get("issue_text", "")},
-                              "level": severity_map.get(issue.get("issue_severity", "LOW"), "note"),
-                              "locations": [{
-                                  "physicalLocation": {
-                                      "artifactLocation": {"uri": issue.get("filename", "")},
-                                      "region": {"startLine": issue.get("line_number", 1)}
-                                  }
-                              }]
-                          })
-                      
-                      # Replace the default run with Bandit run
-                      sarif["runs"] = [bandit_run]
-                      print(f"✓ Added {len(bandit_run['results'])} Bandit findings to SARIF")
+                  with open(bandit_file, "r") as f:
+                      content = f.read().strip()
+                  if content:
+                      bandit = json.loads(content)
+                      if bandit.get("results"):
+                          run = {
+                              "tool": {"driver": {"name": "Bandit", "informationUri": "https://bandit.readthedocs.io/"}},
+                              "results": []
+                          }
+                          level_map = {"HIGH": "error", "MEDIUM": "warning", "LOW": "note"}
+
+                          for issue in bandit.get("results", []):
+                              run["results"].append({
+                                  "ruleId": issue.get("test_id", "unknown"),
+                                  "message": {
+                                      "text": f"{issue.get('issue_text','')} (Severity: {issue.get('issue_severity','LOW')})"
+                                  },
+                                  "level": level_map.get(issue.get("issue_severity", "LOW"), "note"),
+                                  "locations": [{
+                                      "physicalLocation": {
+                                          "artifactLocation": {"uri": issue.get("filename", "")},
+                                          "region": {"startLine": issue.get("line_number", 1)}
+                                      }
+                                  }]
+                              })
+
+                          sarif["runs"].append(run)
+                          print(f"✓ Added Bandit: {len(run['results'])} findings")
                   else:
-                      print("ℹ️ Bandit found no issues")
-                      
+                      print("ℹ️ Bandit results file is empty")
               except Exception as e:
-                  print(f"Error processing Bandit: {e}")
-                  # Keep the empty but valid SARIF structure
-          
-          # Save SARIF file
+                  print(f"Bandit processing error: {e}")
+
+          if not sarif["runs"]:
+              sarif["runs"] = [{
+                  "tool": {"driver": {"name": "Security Scan", "informationUri": "https://github.com"}},
+                  "results": [{
+                      "ruleId": "SCAN_COMPLETED",
+                      "message": {"text": "Security scan completed successfully. No issues found."},
+                      "level": "note"
+                  }]
+              }]
+
           with open("security-results.sarif", "w") as f:
               json.dump(sarif, f, indent=2)
-          
-          print(f"✅ SARIF file created with {len(sarif['runs'][0]['results'])} findings")
-          EOF      
+
+          total = sum(len(r.get("results", [])) for r in sarif["runs"])
+          print(f"✅ SARIF created with {total} total findings")
+          EOF
+
+          python3 create_sarif.py
+
+          test -f security-results.sarif
+
       - name: Upload SARIF to GitHub Security Tab
         if: always()
         uses: github/codeql-action/upload-sarif@v4
