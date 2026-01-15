@@ -277,26 +277,57 @@ jobs:
           RESOURCE_GROUP="${{ needs.verify-prereqs-and-infra.outputs.resource_group }}"
           FUNCTION_APP="${{ needs.verify-prereqs-and-infra.outputs.function_app }}"
 
-          sleep 30
+          echo "Resource Group: $RESOURCE_GROUP"
+          echo "Function App:   $FUNCTION_APP"
+          echo ""
 
+          echo "Azure account context:"
+          az account show -o table
+          echo ""
+
+          echo "Waiting for deployment to propagate..."
+          sleep 30
+          echo ""
+
+          echo "Fetching Function App JSON..."
           az functionapp show \
             --name "$FUNCTION_APP" \
             --resource-group "$RESOURCE_GROUP" \
-            --query "{name:name, state:state, defaultHostName:defaultHostName, lastModifiedTime:lastModifiedTime}" \
-            -o table
+            -o json > functionapp.json
 
-          HOST=$(az functionapp show \
-            --name "$FUNCTION_APP" \
-            --resource-group "$RESOURCE_GROUP" \
-            --query "defaultHostName" -o tsv)
+          echo ""
+          echo "Function App key fields:"
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y jq >/dev/null
+          jq -r '{name:.name, state:.state, defaultHostName:.defaultHostName, hostNames:.hostNames, enabled:.enabled, kind:.kind, location:.location}' functionapp.json
+          echo ""
 
+          HOST=$(jq -r '.defaultHostName // empty' functionapp.json | tr -d '\r\n')
+
+          if [ -z "$HOST" ]; then
+            echo "❌ defaultHostName is EMPTY."
+            echo "This usually means one of these:"
+            echo "1) Wrong subscription/tenant context"
+            echo "2) The resource returned is not a Microsoft.Web/sites Function App"
+            echo "3) API returned unexpected shape / permissions issue"
+            echo ""
+            echo "Dumping full JSON (sanitized fields):"
+            jq -r '{id, name, type, kind, location, state, defaultHostName, hostNames, enabled}' functionapp.json
+            exit 1
+          fi
+
+          echo "✅ Host resolved"
           echo "URL: https://$HOST"
 
-          if curl -s -f --max-time 10 "https://$HOST" > /dev/null 2>&1; then
-            echo "✅ Function App reachable"
+          echo ""
+          echo "NOTE: Azure Functions often does NOT respond on /"
+          echo "Testing basic HTTPS connectivity to host (will often 404, but should connect)..."
+          if curl -s --max-time 10 -I "https://$HOST" >/dev/null 2>&1; then
+            echo "✅ HTTPS connection established"
           else
-            echo "⚠️  Not reachable yet (may still be warming up)"
+            echo "⚠️  Could not connect yet (warmup/network/DNS)."
           fi
+
 
       - name: Update App Deployment Status in App Config
         shell: bash
