@@ -8,7 +8,7 @@ on:
     types: [completed]
 
   # Manual trigger for controlled deploys (hotfix / rerun)
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -36,17 +36,21 @@ jobs:
     steps:
       - name: Determine SHA to deploy
         id: sha
+        shell: bash
         run: |
+          set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_run" ]; then
-            echo "SHA=${{ github.event.workflow_run.head_sha }}" >> $GITHUB_OUTPUT
-            echo "REF=${{ github.event.workflow_run.head_branch }}" >> $GITHUB_OUTPUT
+            echo "SHA=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+            echo "REF=${{ github.event.workflow_run.head_branch }}" >> "$GITHUB_OUTPUT"
           else
-            echo "SHA=${{ github.sha }}" >> $GITHUB_OUTPUT
-            echo "REF=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "SHA=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            echo "REF=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 'Gate: Only deploy from develop'
+      - name: Only deploy from develop
+        shell: bash
         run: |
+          set -euo pipefail
           if [ "${{ steps.sha.outputs.REF }}" != "develop" ]; then
             echo "❌ Not on develop branch. Ref is: ${{ steps.sha.outputs.REF }}"
             exit 1
@@ -56,10 +60,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ steps.sha.outputs.SHA }}
+        shell: bash
         run: |
+          set -euo pipefail
           echo "Verifying workflow success for SHA: $SHA"
 
-          sudo apt-get update -y && sudo apt-get install -y jq
+          # jq is available on ubuntu-latest, but installing explicitly is safe
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+          # Ensure gh is available
+          gh --version
 
           # Get recent workflow runs on develop and filter by SHA + workflow name
           RUNS=$(gh api \
@@ -102,7 +113,9 @@ jobs:
 
       - name: Read Infra Contract from App Configuration
         id: infra
+        shell: bash
         run: |
+          set -euo pipefail
           echo "Reading infra contract from App Config..."
 
           APP_CONFIG_NAME="${{ vars.APP_CONFIG_NAME_DEV }}"
@@ -139,14 +152,14 @@ jobs:
           echo "  Resource Group: $RESOURCE_GROUP"
           echo "  Function App:   $FUNCTION_APP"
 
-          # Basic sanity
           if [ -z "$RESOURCE_GROUP" ] || [ -z "$FUNCTION_APP" ]; then
             echo "❌ Infra contract values missing in App Config."
             exit 1
           fi
 
-          echo "RESOURCE_GROUP=$RESOURCE_GROUP" >> $GITHUB_OUTPUT
-          echo "FUNCTION_APP=$FUNCTION_APP" >> $GITHUB_OUTPUT
+          echo "RESOURCE_GROUP=$RESOURCE_GROUP" >> "$GITHUB_OUTPUT"
+          echo "FUNCTION_APP=$FUNCTION_APP" >> "$GITHUB_OUTPUT"
+          echo "APP_CONFIG=$APP_CONFIG_NAME" >> "$GITHUB_OUTPUT"
 
   # ===========================
   # 2) BUILD ZIP PACKAGE FOR DEV
@@ -166,14 +179,16 @@ jobs:
           python-version: "3.11"
 
       - name: Build Azure Functions ZIP package
+        shell: bash
         run: |
+          set -euo pipefail
           echo "=== Building Azure Functions Package ==="
 
           DEPLOY_DIR="deploy-dev"
           rm -rf "$DEPLOY_DIR"
           mkdir -p "$DEPLOY_DIR"
 
-          # Adjust to your actual structure (your tests reference function_app/)
+          # Adjust to your actual structure (tests reference function_app/)
           if [ -d "function_app" ]; then
             cp -r function_app/ "$DEPLOY_DIR/"
           elif [ -d "src" ]; then
@@ -233,7 +248,9 @@ jobs:
           audience: api://AzureADTokenExchange
 
       - name: Deploy ZIP to Function App
+        shell: bash
         run: |
+          set -euo pipefail
           echo "=== DEPLOYING TO DEVELOPMENT ==="
 
           RESOURCE_GROUP="${{ needs.verify-prereqs-and-infra.outputs.resource_group }}"
@@ -252,7 +269,9 @@ jobs:
           echo "✅ Deployment initiated"
 
       - name: Verify Deployment
+        shell: bash
         run: |
+          set -euo pipefail
           echo "=== VERIFYING DEV DEPLOYMENT ==="
 
           RESOURCE_GROUP="${{ needs.verify-prereqs-and-infra.outputs.resource_group }}"
@@ -280,11 +299,12 @@ jobs:
           fi
 
       - name: Update App Deployment Status in App Config
+        shell: bash
         run: |
+          set -euo pipefail
           echo "=== WRITING APP DEPLOYMENT STATUS ==="
 
           APP_CONFIG="${{ needs.verify-prereqs-and-infra.outputs.app_config }}"
-          RESOURCE_GROUP="${{ needs.verify-prereqs-and-infra.outputs.resource_group }}"
 
           az appconfig kv set \
             --name "$APP_CONFIG" \
@@ -311,7 +331,9 @@ jobs:
 
     steps:
       - name: Generate Summary
+        shell: bash
         run: |
+          set -euo pipefail
           cat > dev-summary.md <<EOF
           # Development Deployment Summary
 
