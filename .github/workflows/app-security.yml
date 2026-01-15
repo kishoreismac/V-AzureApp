@@ -1,0 +1,254 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - '**/*.py'
+      - '**/*.json'
+      - '**/*.yml'
+      - 'requirements.txt'
+
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    - cron: '0 9 * * 1'  # Weekly Monday 9 AM UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      
+      # ========================================
+      # 1. SECRET SCANNING
+      # ========================================
+      - name: Run Gitleaks (Secret Scanner)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+      
+      # ========================================
+      # 2. SAST - STATIC APPLICATION SECURITY TESTING
+      # ========================================
+      - name: Install SAST tools
+        run: |
+          pip install bandit semgrep pylint
+      
+      - name: Run Bandit (Python SAST)
+        run: |
+          mkdir -p security-reports
+          bandit -r . \
+            -f json -o security-reports/bandit-results.json \
+            -ll \
+            --severity-level medium || true
+      
+      - name: Run Semgrep (Advanced SAST)
+        run: |
+          semgrep \
+            --config=auto \
+            --config=p/python \
+            --json \
+            --output security-reports/semgrep-results.json \
+            . || true
+      
+      # ========================================
+      # 3. DEPENDENCY SCANNING
+      # ========================================
+      - name: Install dependency scanners
+        run: |
+          pip install safety pip-audit
+      
+      - name: Run Safety (Dependency Vulnerabilities)
+        run: |
+          if [ -f "requirements.txt" ]; then
+            safety check \
+              --file requirements.txt \
+              --json \
+              --output security-reports/safety-results.json || true
+          else
+            echo "{}" > security-reports/safety-results.json
+          fi
+      
+      - name: Run pip-audit (CVE Scanner)
+        run: |
+          if [ -f "requirements.txt" ]; then
+            pip-audit \
+              -r requirements.txt \
+              --format json \
+              --output security-reports/pip-audit-results.json || true
+          else
+            echo "{}" > security-reports/pip-audit-results.json
+          fi
+      
+      # ========================================
+      # 4. AZURE FUNCTIONS SPECIFIC CHECKS
+      # ========================================
+      - name: Azure Functions Security Audit
+        run: |
+          echo "=== Azure Functions Security Checks ===" > security-reports/azure-functions-security.txt
+          
+          # Check for HTTP triggers without authentication
+          echo "1. Checking HTTP triggers authentication..." >> security-reports/azure-functions-security.txt
+          if grep -r "@app.route" --include="*.py" . | grep -v "auth_level" | grep -v "#.*auth_level"; then
+            echo "   ⚠️  Found HTTP trigger without explicit auth_level" >> security-reports/azure-functions-security.txt
+          else
+            echo "   ✅ All HTTP triggers have auth_level" >> security-reports/azure-functions-security.txt
+          fi
+          
+          echo "" >> security-reports/azure-functions-security.txt
+          
+          # Check for hardcoded Azure resources
+          echo "2. Checking for hardcoded Azure resources..." >> security-reports/azure-functions-security.txt
+          AZURE_PATTERNS=(
+            ".azconfig.io"
+            ".vault.azure.net"
+            ".blob.core.windows.net"
+            "AccountKey="
+            "DefaultEndpointsProtocol="
+            "Endpoint="
+          )
+          
+          FOUND=0
+          for pattern in "${AZURE_PATTERNS[@]}"; do
+            if grep -r "$pattern" --include="*.py" --include="*.json" . 2>/dev/null; then
+              echo "   ❌ Found hardcoded: $pattern" >> security-reports/azure-functions-security.txt
+              FOUND=1
+            fi
+          done
+          
+          if [ $FOUND -eq 0 ]; then
+            echo "   ✅ No hardcoded Azure resources" >> security-reports/azure-functions-security.txt
+          fi
+          
+          cat security-reports/azure-functions-security.txt
+      
+      # ========================================
+      # 5. GENERATE REPORTS
+      # ========================================
+      - name: Generate Security Summary
+        if: always()
+        run: |
+          echo "=== SECURITY SCAN SUMMARY ==="
+          echo ""
+          echo "📊 Scan Results:"
+          
+          if [ -f "security-reports/bandit-results.json" ]; then
+            BANDIT_ISSUES=$(jq '.results | length' security-reports/bandit-results.json 2>/dev/null || echo "0")
+            echo "- SAST (Bandit): $BANDIT_ISSUES issues"
+          fi
+          
+          if [ -f "security-reports/safety-results.json" ]; then
+            SAFETY_VULNS=$(jq '.vulnerabilities | length' security-reports/safety-results.json 2>/dev/null || echo "0")
+            echo "- Dependencies (Safety): $SAFETY_VULNS vulnerabilities"
+          fi
+          
+          echo ""
+          echo "📁 Reports saved to: security-reports/"
+      
+      # ========================================
+      # 6. UPLOAD ARTIFACTS
+      # ========================================
+      - name: Upload Security Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-${{ github.run_id }}
+          path: security-reports/
+          retention-days: 90
+        
+      # ========================================
+      # 7. CONVERT TO SARIF FOR GITHUB SECURITY TAB
+      # ========================================
+      - name: Create SARIF report
+        if: always()
+        id: create-sarif
+        run: |
+          echo "=== Creating SARIF Report ==="
+
+          cat > create_sarif.py <<'EOF'
+          import json
+          import os
+
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": []
+          }
+
+          bandit_file = "security-reports/bandit-results.json"
+          if os.path.exists(bandit_file):
+              try:
+                  with open(bandit_file, "r") as f:
+                      content = f.read().strip()
+                  if content:
+                      bandit = json.loads(content)
+                      if bandit.get("results"):
+                          run = {
+                              "tool": {"driver": {"name": "Bandit", "informationUri": "https://bandit.readthedocs.io/"}},
+                              "results": []
+                          }
+                          level_map = {"HIGH": "error", "MEDIUM": "warning", "LOW": "note"}
+
+                          for issue in bandit.get("results", []):
+                              run["results"].append({
+                                  "ruleId": issue.get("test_id", "unknown"),
+                                  "message": {"text": f"{issue.get('issue_text','')} (Severity: {issue.get('issue_severity','LOW')})"},
+                                  "level": level_map.get(issue.get("issue_severity", "LOW"), "note"),
+                                  "locations": [{
+                                      "physicalLocation": {
+                                          "artifactLocation": {"uri": issue.get("filename", "")},
+                                          "region": {"startLine": issue.get("line_number", 1)}
+                                      }
+                                  }]
+                              })
+
+                          sarif["runs"].append(run)
+                          print(f"✓ Added Bandit: {len(run['results'])} findings")
+                  else:
+                      print("ℹ️ Bandit results file is empty")
+              except Exception as e:
+                  print(f"Bandit processing error: {e}")
+
+          # IMPORTANT: no placeholder "result" without locations
+          if not sarif["runs"]:
+              sarif["runs"] = [{
+                  "tool": {"driver": {"name": "Security Scan", "informationUri": "https://github.com"}},
+                  "results": []
+              }]
+              print("ℹ️ No findings; uploading empty SARIF run")
+
+          with open("security-results.sarif", "w") as f:
+              json.dump(sarif, f, indent=2)
+
+          total = sum(len(r.get("results", [])) for r in sarif["runs"])
+          print(f"✅ SARIF created with {total} total findings")
+
+          EOF
+
+          python3 create_sarif.py
+
+          test -f security-results.sarif
+
+      - name: Upload SARIF to GitHub Security Tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: security-results.sarif
