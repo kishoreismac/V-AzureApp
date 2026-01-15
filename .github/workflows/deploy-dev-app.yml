@@ -173,7 +173,7 @@ jobs:
           rm -rf "$DEPLOY_DIR"
           mkdir -p "$DEPLOY_DIR"
 
-          # Adjust to your actual structure (your tests reference function_app/) :contentReference[oaicite:3]{index=3}
+          # Adjust to your actual structure (your tests reference function_app/)
           if [ -d "function_app" ]; then
             cp -r function_app/ "$DEPLOY_DIR/"
           elif [ -d "src" ]; then
