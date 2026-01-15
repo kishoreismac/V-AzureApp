@@ -1,0 +1,391 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - '**/*.py'
+      - '**/*.json'
+      - '**/*.yaml'
+      - '**/*.yml'
+      - 'requirements.txt'
+      - 'Makefile'
+      - 'pyproject.toml'
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Run weekly on Monday at 9 AM UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'Type of scan to run'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - quick
+          - full
+          - dependencies
+          - secrets
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better secret detection
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      
+      # ========================================
+      # 1. SECRET SCANNING
+      # ========================================
+      - name: Run Gitleaks (Secret Scanner)
+        if: ${{ github.event.inputs.scan_type == 'secrets' || github.event.inputs.scan_type == 'full' || !github.event.inputs.scan_type }}
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          config-path: .gitleaks.toml  # Optional custom config
+        continue-on-error: true  # Don't fail pipeline on findings
+      
+      - name: Run TruffleHog (Alternative Secret Scanner)
+        if: ${{ github.event.inputs.scan_type == 'secrets' || github.event.inputs.scan_type == 'full' || !github.event.inputs.scan_type }}
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+        continue-on-error: true
+      
+      # ========================================
+      # 2. SAST - STATIC APPLICATION SECURITY TESTING
+      # ========================================
+      - name: Install SAST tools
+        if: ${{ github.event.inputs.scan_type == 'full' || !github.event.inputs.scan_type }}
+        run: |
+          pip install bandit semgrep pylint
+      
+      - name: Run Bandit (Python SAST)
+        if: ${{ github.event.inputs.scan_type == 'full' || !github.event.inputs.scan_type }}
+        id: bandit-scan
+        run: |
+          echo "=== Running Bandit SAST Scan ==="
+          
+          # Create output directory
+          mkdir -p security-reports
+          
+          # Run Bandit with multiple outputs
+          bandit -r . \
+            -f json -o security-reports/bandit-results.json \
+            -f txt -o security-reports/bandit-results.txt \
+            -ll \
+            --severity-level medium
+          
+          echo "Bandit scan completed"
+          echo "Results saved to security-reports/"
+      
+      - name: Run Semgrep (Advanced SAST)
+        if: ${{ github.event.inputs.scan_type == 'full' || !github.event.inputs.scan_type }}
+        id: semgrep-scan
+        run: |
+          echo "=== Running Semgrep Advanced SAST ==="
+          
+          # Run Semgrep with security rules
+          semgrep \
+            --config=auto \
+            --config=p/python \
+            --config=p/security-audit \
+            --json --output security-reports/semgrep-results.json \
+            . || true
+          
+          # Generate human-readable output
+          semgrep --config=auto . --quiet || true
+      
+      - name: Run Pylint Security Checks
+        if: ${{ github.event.inputs.scan_type == 'full' || !github.event.inputs.scan_type }}
+        run: |
+          echo "=== Running Pylint Security Checks ==="
+          
+          pylint . \
+            --disable=all \
+            --enable=security \
+            --output-format=text > security-reports/pylint-security.txt 2>&1 || true
+          
+          echo "Pylint security checks completed"
+      
+      # ========================================
+      # 3. SCA - SOFTWARE COMPOSITION ANALYSIS
+      # ========================================
+      - name: Install SCA tools
+        if: ${{ github.event.inputs.scan_type == 'dependencies' || github.event.inputs.scan_type == 'full' || !github.event.inputs.scan_type }}
+        run: |
+          pip install safety pip-audit
+      
+      - name: Run Safety (Dependency Vulnerabilities)
+        if: ${{ github.event.inputs.scan_type == 'dependencies' || github.event.inputs.scan_type == 'full' || !github.event.inputs.scan_type }}
+        id: safety-scan
+        run: |
+          echo "=== Running Safety Dependency Scan ==="
+          
+          if [ -f "requirements.txt" ]; then
+            safety check \
+              --file requirements.txt \
+              --json --output security-reports/safety-results.json \
+              --output text security-reports/safety-results.txt
+          else
+            echo "⚠️ No requirements.txt found"
+            echo "{}" > security-reports/safety-results.json
+          fi
+      
+      - name: Run pip-audit (CVE Scanner)
+        if: ${{ github.event.inputs.scan_type == 'dependencies' || github.event.inputs.scan_type == 'full' || !github.event.inputs.scan_type }}
+        id: pip-audit-scan
+        run: |
+          echo "=== Running pip-audit CVE Scan ==="
+          
+          if [ -f "requirements.txt" ]; then
+            pip-audit \
+              -r requirements.txt \
+              --format json --output security-reports/pip-audit-results.json \
+              2>&1 | tee security-reports/pip-audit-output.txt
+          else
+            echo "⚠️ No requirements.txt found"
+            echo "{}" > security-reports/pip-audit-results.json
+          fi
+      
+      # ========================================
+      # 4. AZURE-SPECIFIC SECURITY CHECKS
+      # ========================================
+      - name: Azure Functions Security Audit
+        if: ${{ github.event.inputs.scan_type == 'full' || !github.event.inputs.scan_type }}
+        run: |
+          echo "=== Azure Functions Security Audit ===" > security-reports/azure-audit.txt
+          echo "" >> security-reports/azure-audit.txt
+          
+          # Check for HTTP triggers without authentication
+          echo "1. Checking HTTP triggers..." >> security-reports/azure-audit.txt
+          if grep -r "@app.route" --include="*.py" . | grep -v "auth_level" | grep -v "#.*auth_level"; then
+            echo "   ⚠️  Found HTTP trigger without explicit auth_level" >> security-reports/azure-audit.txt
+          else
+            echo "   ✅ All HTTP triggers have auth_level specified" >> security-reports/azure-audit.txt
+          fi
+          
+          echo "" >> security-reports/azure-audit.txt
+          
+          # Check for hardcoded Azure resources
+          echo "2. Checking for hardcoded Azure resources..." >> security-reports/azure-audit.txt
+          AZURE_PATTERNS=(
+            ".azconfig.io"
+            ".vault.azure.net"
+            ".blob.core.windows.net"
+            "AccountKey="
+            "DefaultEndpointsProtocol="
+            "Endpoint="
+          )
+          
+          FOUND=0
+          for pattern in "${AZURE_PATTERNS[@]}"; do
+            if grep -r "$pattern" --include="*.py" --include="*.json" . 2>/dev/null; then
+              echo "   ❌ Found hardcoded: $pattern" >> security-reports/azure-audit.txt
+              FOUND=1
+            fi
+          done
+          
+          if [ $FOUND -eq 0 ]; then
+            echo "   ✅ No hardcoded Azure resources found" >> security-reports/azure-audit.txt
+          fi
+          
+          echo "" >> security-reports/azure-audit.txt
+          echo "Azure Functions security audit completed" >> security-reports/azure-audit.txt
+          
+          cat security-reports/azure-audit.txt
+      
+      # ========================================
+      # 5. REPORT GENERATION
+      # ========================================
+      - name: Generate Security Summary
+        if: always()
+        id: generate-summary
+        run: |
+          echo "=== GENERATING SECURITY SUMMARY ==="
+          
+          SUMMARY_FILE="security-reports/security-summary.md"
+          
+          echo "# Security Scan Summary" > $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+          echo "**Scan Date:** $(date)" >> $SUMMARY_FILE
+          echo "**Branch:** ${{ github.ref }}" >> $SUMMARY_FILE
+          echo "**Event:** ${{ github.event_name }}" >> $SUMMARY_FILE
+          echo "**Run ID:** ${{ github.run_id }}" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+          
+          echo "## Scan Results" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+          
+          # Bandit results
+          if [ -f "security-reports/bandit-results.json" ]; then
+            BANDIT_ISSUES=$(jq '.results | length' security-reports/bandit-results.json 2>/dev/null || echo "0")
+            echo "- **SAST (Bandit):** $BANDIT_ISSUES issues found" >> $SUMMARY_FILE
+            
+            # Count by severity
+            HIGH=$(jq '.results[] | select(.issue_severity == "HIGH")' security-reports/bandit-results.json | jq -s length 2>/dev/null || echo "0")
+            MEDIUM=$(jq '.results[] | select(.issue_severity == "MEDIUM")' security-reports/bandit-results.json | jq -s length 2>/dev/null || echo "0")
+            LOW=$(jq '.results[] | select(.issue_severity == "LOW")' security-reports/bandit-results.json | jq -s length 2>/dev/null || echo "0")
+            
+            if [ "$HIGH$MEDIUM$LOW" != "000" ]; then
+              echo "  - High: $HIGH, Medium: $MEDIUM, Low: $LOW" >> $SUMMARY_FILE
+            fi
+          fi
+          
+          # Safety results
+          if [ -f "security-reports/safety-results.json" ]; then
+            SAFETY_VULNS=$(jq '.vulnerabilities | length' security-reports/safety-results.json 2>/dev/null || echo "0")
+            echo "- **Dependencies (Safety):** $SAFETY_VULNS vulnerabilities found" >> $SUMMARY_FILE
+          fi
+          
+          # pip-audit results
+          if [ -f "security-reports/pip-audit-results.json" ]; then
+            PIP_AUDIT_VULNS=$(jq '.vulnerabilities | length' security-reports/pip-audit-results.json 2>/dev/null || echo "0")
+            echo "- **CVEs (pip-audit):** $PIP_AUDIT_VULNS known vulnerabilities" >> $SUMMARY_FILE
+          fi
+          
+          echo "" >> $SUMMARY_FILE
+          echo "## Recommendations" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+          echo "1. Review all findings in the attached reports" >> $SUMMARY_FILE
+          echo "2. Fix HIGH severity issues before deployment" >> $SUMMARY_FILE
+          echo "3. Update vulnerable dependencies" >> $SUMMARY_FILE
+          echo "4. Remove any hardcoded secrets or configuration" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE
+          echo "---" >> $SUMMARY_FILE
+          echo "*Scan completed successfully*" >> $SUMMARY_FILE
+          
+          cat $SUMMARY_FILE
+      
+      # ========================================
+      # 6. UPLOAD ARTIFACTS
+      # ========================================
+      - name: Upload Security Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-${{ github.run_id }}
+          path: |
+            security-reports/
+          retention-days: 90
+      
+      - name: Convert to SARIF for GitHub Security Tab
+        if: always()
+        id: convert-sarif
+        run: |
+          echo "=== Converting to SARIF format ==="
+          
+          python3 << 'EOF'
+          import json
+          import os
+          
+          # Create basic SARIF structure
+          sarif = {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": []
+          }
+          
+          # Add Bandit results if exists
+          bandit_file = "security-reports/bandit-results.json"
+          if os.path.exists(bandit_file):
+              try:
+                  with open(bandit_file, 'r') as f:
+                      bandit_data = json.load(f)
+                  
+                  bandit_run = {
+                      "tool": {
+                          "driver": {
+                              "name": "Bandit",
+                              "informationUri": "https://bandit.readthedocs.io/"
+                          }
+                      },
+                      "results": []
+                  }
+                  
+                  for issue in bandit_data.get("results", []):
+                      severity_map = {"HIGH": "error", "MEDIUM": "warning", "LOW": "note"}
+                      
+                      result = {
+                          "ruleId": issue.get("test_id", "unknown"),
+                          "message": {"text": issue.get("issue_text", "")},
+                          "level": severity_map.get(issue.get("issue_severity", "LOW"), "note"),
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": issue.get("filename", "")},
+                                  "region": {"startLine": issue.get("line_number", 1)}
+                              }
+                          }]
+                      }
+                      bandit_run["results"].append(result)
+                  
+                  sarif["runs"].append(bandit_run)
+                  print("✓ Added Bandit results to SARIF")
+              except Exception as e:
+                  print(f"Error processing Bandit: {e}")
+          
+          # Save SARIF file
+          with open("security-results.sarif", "w") as f:
+              json.dump(sarif, f, indent=2)
+          
+          print("✅ SARIF file created: security-results.sarif")
+          EOF
+      
+      - name: Upload SARIF to GitHub Security Tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: security-results.sarif
+      
+      # ========================================
+      # 7. PR COMMENTING
+      # ========================================
+      - name: Comment on PR with Results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const summary = `## 🔒 Security Scan Results
+            
+            ### Scan Summary
+            - **Scan Type:** ${process.env.SCAN_TYPE || 'Full scan'}
+            - **Status:** ${process.env.JOB_STATUS === 'success' ? '✅ Completed' : '⚠️ Completed with findings'}
+            - **Run ID:** ${context.runId}
+            
+            ### 📊 Findings Summary
+            (Check artifacts for detailed reports)
+            
+            ### 🔍 Next Steps
+            1. Download security reports from artifacts
+            2. Review HIGH severity issues first
+            3. Update vulnerable dependencies if any
+            4. Remove hardcoded secrets/configurations
+            
+            📎 **Reports:** [security-reports-${context.runId}.zip](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            `;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
