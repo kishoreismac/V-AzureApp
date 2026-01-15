@@ -192,20 +192,14 @@ jobs:
           cp host.json "$DEPLOY_DIR/"
           cp requirements.txt "$DEPLOY_DIR/" 2>/dev/null || echo "No requirements.txt found"
 
-          # IMPORTANT:
-          # You currently have v2 model code in function_app/__init__.py.
-          # For reliable discovery, place it at ZIP root as function_app.py
-          if [ -f "function_app/__init__.py" ]; then
-            cp function_app/__init__.py "$DEPLOY_DIR/function_app.py"
+          # v2 model entrypoint file at root
+          if [ -f "function_app.py" ]; then
+            cp function_app.py "$DEPLOY_DIR/function_app.py"
           else
-            echo "❌ Expected function_app/__init__.py not found."
+            echo "❌ Expected function_app.py at repo root not found."
+            ls -la
             exit 1
           fi
-
-          # Optional: include any shared modules under function_app/ (excluding __init__.py)
-          # This allows you to later split code into multiple files.
-          mkdir -p "$DEPLOY_DIR/function_app"
-          rsync -a --exclude="__init__.py" function_app/ "$DEPLOY_DIR/function_app/" || true
 
           cat > "$DEPLOY_DIR/.funcignore" << 'EOF'
           __pycache__
@@ -225,7 +219,7 @@ jobs:
           echo "Size: $(du -h function-app-dev.zip | cut -f1)"
 
           echo "=== ZIP ROOT CONTENTS ==="
-          unzip -l function-app-dev.zip | head -n 40
+          unzip -l function-app-dev.zip | head -n 60
 
       - name: Upload Dev Package
         uses: actions/upload-artifact@v4
