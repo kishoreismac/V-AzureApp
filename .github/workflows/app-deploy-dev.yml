@@ -1,7 +1,7 @@
 name: Deploy to Development
 
 on:
-  # Deploy only when a PR into develop is merged (closed + merged == true)
+  # Deploy only when a PR into develop is merged 
   pull_request:
     branches: ["develop"]
     types: [closed]
