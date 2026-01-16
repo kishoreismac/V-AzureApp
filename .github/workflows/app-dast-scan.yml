@@ -1,0 +1,252 @@
+name: App DAST Scan (Development)
+
+on:
+  # Run ONLY after integration workflow succeeds (post-deploy)
+  workflow_run:
+    workflows:
+      - "App Integration Tests (Development)"   # <-- MUST match your integration workflow name exactly
+    types: [completed]
+
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: dast-dev-develop
+  cancel-in-progress: false
+
+jobs:
+  # ==========================================================
+  # 1) RESOLVE TARGET URL (NO BUILD/DEPLOY/TEST REPEATS)
+  # ==========================================================
+  resolve-target:
+    name: Resolve DAST Target (Dev)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    environment: development
+
+    outputs:
+      target_url: ${{ steps.out.outputs.TARGET_URL }}
+      host: ${{ steps.out.outputs.HOST }}
+
+    steps:
+      - name: Azure Login (Dev)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
+          audience: api://AzureADTokenExchange
+
+      - name: Resolve host (App Config preferred; ARM fallback)
+        id: out
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_CONFIG_NAME="${{ vars.APP_CONFIG_NAME_DEV }}"
+          if [ -z "$APP_CONFIG_NAME" ]; then
+            echo "❌ vars.APP_CONFIG_NAME_DEV is not set for environment 'development'."
+            exit 1
+          fi
+
+          # Prefer: value written by deploy workflow (you can add this key in deploy once stable)
+          # AppDeployment:Development:Host = <app>.azurewebsites.net
+          HOST=$(az appconfig kv show \
+            --name "$APP_CONFIG_NAME" \
+            --key "AppDeployment:Development:Host" \
+            --auth-mode login \
+            --query "value" -o tsv 2>/dev/null || true)
+
+          # If not found, fall back to infra contract + ARM lookup
+          if [ -z "$HOST" ] || [ "$HOST" = "null" ]; then
+            RESOURCE_GROUP=$(az appconfig kv show \
+              --name "$APP_CONFIG_NAME" \
+              --key "InfraPipeline:ResourceGroupName" \
+              --auth-mode login \
+              --query "value" -o tsv)
+
+            FUNCTION_APP=$(az appconfig kv show \
+              --name "$APP_CONFIG_NAME" \
+              --key "InfraPipeline:FunctionAppName" \
+              --auth-mode login \
+              --query "value" -o tsv)
+
+            if [ -z "$RESOURCE_GROUP" ] || [ -z "$FUNCTION_APP" ]; then
+              echo "❌ Missing InfraPipeline:ResourceGroupName or InfraPipeline:FunctionAppName in App Config."
+              exit 1
+            fi
+
+            RID=$(az functionapp show \
+              --name "$FUNCTION_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --query "id" -o tsv)
+
+            HOST=$(az resource show --ids "$RID" --query "properties.defaultHostName" -o tsv 2>/dev/null || true)
+            if [ -z "$HOST" ] || [ "$HOST" = "null" ]; then
+              HOST=$(az resource show --ids "$RID" --query "properties.hostNames[0]" -o tsv 2>/dev/null || true)
+            fi
+          fi
+
+          if [ -z "$HOST" ] || [ "$HOST" = "null" ]; then
+            echo "❌ Could not resolve host for DAST."
+            exit 1
+          fi
+
+          # Your function route (adjust if you change it)
+          # NOTE: If your function requires AuthLevel.FUNCTION, provide code via secret.
+          BASE="https://$HOST/api/http_trigger"
+          if [ -n "${{ secrets.AZURE_FUNCTION_KEY_DEV }}" ]; then
+            TARGET_URL="${BASE}?name=dast&code=${{ secrets.AZURE_FUNCTION_KEY_DEV }}"
+          else
+            # DAST will still run, but may get 401/403 if auth is enforced.
+            TARGET_URL="${BASE}?name=dast"
+          fi
+
+          echo "Resolved:"
+          echo "  HOST=$HOST"
+          echo "  TARGET_URL=$TARGET_URL"
+
+          echo "HOST=$HOST" >> "$GITHUB_OUTPUT"
+          echo "TARGET_URL=$TARGET_URL" >> "$GITHUB_OUTPUT"
+
+  # ==========================================================
+  # 2) DAST (OWASP ZAP BASELINE)
+  # ==========================================================
+  dast:
+    name: DAST (OWASP ZAP Baseline) - Dev
+    runs-on: ubuntu-latest
+    needs: resolve-target
+    environment: development
+
+    steps:
+      - name: Run ZAP Baseline
+        # Official ZAP baseline container image
+        # Baseline: passive scan + spider; good for CI gating.
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_URL="${{ needs.resolve-target.outputs.target_url }}"
+          echo "DAST target: $TARGET_URL"
+
+          mkdir -p zap-out
+
+          # Baseline scan:
+          # -r: HTML report
+          # -J: JSON report
+          # -x: XML report
+          # -m: spider minutes (keep short for dev)
+          # -T: max scan time (seconds)
+          # -I: ignore passive scan rules? (we are NOT ignoring)
+          docker run --rm \
+            -v "${PWD}/zap-out:/zap/wrk" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t "$TARGET_URL" \
+              -m 2 \
+              -T 240 \
+              -r zap-report.html \
+              -J zap-report.json \
+              -x zap-report.xml \
+              -d
+
+      - name: Upload DAST reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-dev-reports
+          path: zap-out
+          retention-days: 14
+
+      - name: Enforce policy (fail on High)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ZAP baseline exits non-zero for findings depending on config,
+          # so we enforce explicitly by parsing JSON.
+          python3 - << 'PY'
+          import json, sys, pathlib
+
+          p = pathlib.Path("zap-out/zap-report.json")
+          if not p.exists():
+            print("❌ Missing zap-report.json")
+            sys.exit(2)
+
+          data = json.loads(p.read_text(encoding="utf-8"))
+
+          # ZAP JSON structure from baseline:
+          # site[].alerts[] with riskcode: "0".."3"
+          # 3=High, 2=Medium, 1=Low, 0=Info
+          highs = 0
+          mediums = 0
+
+          for site in data.get("site", []):
+            for a in site.get("alerts", []):
+              rc = str(a.get("riskcode", "0"))
+              if rc == "3":
+                highs += 1
+              elif rc == "2":
+                mediums += 1
+
+          print(f"ZAP summary: High={highs}, Medium={mediums}")
+
+          # Best-practice gate (adjust to your policy)
+          if highs > 0:
+            print("❌ DAST policy failed: High findings detected.")
+            sys.exit(3)
+
+          print("✅ DAST policy passed (no High findings).")
+          PY
+
+  # ==========================================================
+  # 3) WRITE STATUS (NO REPEATS)
+  # ==========================================================
+  write-status:
+    name: Write DAST Status (App Config)
+    runs-on: ubuntu-latest
+    needs: [resolve-target, dast]
+    if: always()
+    environment: development
+
+    steps:
+      - name: Azure Login (Dev)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
+          audience: api://AzureADTokenExchange
+
+      - name: Write status to App Config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_CONFIG_NAME="${{ vars.APP_CONFIG_NAME_DEV }}"
+          if [ -z "$APP_CONFIG_NAME" ]; then
+            echo "❌ vars.APP_CONFIG_NAME_DEV is not set."
+            exit 1
+          fi
+
+          RESULT="${{ needs.dast.result }}"
+          TS="$(date -u +%Y%m%d_%H%M%S)"
+          VALUE="${RESULT}_${TS}"
+
+          az appconfig kv set \
+            --name "$APP_CONFIG_NAME" \
+            --key "DAST:Development:Status" \
+            --value "$VALUE" \
+            --tags \
+              "environment=development" \
+              "run_id=${{ github.run_id }}" \
+              "tested_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+              "host=${{ needs.resolve-target.outputs.host }}" \
+            --auth-mode login \
+            --yes \
+            -o jsonc
+
+          echo "✅ Wrote DAST:Development:Status = $VALUE"
