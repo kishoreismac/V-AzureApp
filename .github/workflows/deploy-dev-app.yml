@@ -251,27 +251,6 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
           audience: api://AzureADTokenExchange
 
-      # Optional but recommended: ensure app settings are correct for Python runtime
-      - name: Ensure Function App runtime settings
-        shell: bash
-        run: |
-          set -euo pipefail
-          RESOURCE_GROUP="${{ needs.verify-prereqs-and-infra.outputs.resource_group }}"
-          FUNCTION_APP="${{ needs.verify-prereqs-and-infra.outputs.function_app }}"
-
-          echo "Ensuring runtime settings on $FUNCTION_APP ..."
-
-          az functionapp config appsettings set \
-            --name "$FUNCTION_APP" \
-            --resource-group "$RESOURCE_GROUP" \
-            --settings \
-              FUNCTIONS_WORKER_RUNTIME=python \
-              FUNCTIONS_EXTENSION_VERSION=~4 \
-              WEBSITE_RUN_FROM_PACKAGE=1 \
-              AzureWebJobsFeatureFlags=EnableWorkerIndexing \
-            -o none
-
-          echo "✅ Runtime settings ensured"
 
       - name: Deploy ZIP to Function App
         shell: bash
