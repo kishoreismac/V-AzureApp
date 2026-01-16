@@ -290,67 +290,74 @@ jobs:
       # ---------------------------
       # APP SMOKE TESTS (post-deploy)
       # ---------------------------
-      - name: Smoke Test - Functions indexed + endpoint responds
+      - name: App Smoke Tests (resolve host + list functions + call endpoint)
         shell: bash
         run: |
           set -euo pipefail
 
+          echo "=== APP SMOKE TESTS ==="
           RESOURCE_GROUP="${{ needs.verify-prereqs-and-infra.outputs.resource_group }}"
           FUNCTION_APP="${{ needs.verify-prereqs-and-infra.outputs.function_app }}"
 
-          echo "=== APP SMOKE TESTS ==="
           echo "Resource Group: $RESOURCE_GROUP"
           echo "Function App:   $FUNCTION_APP"
           echo ""
 
-          # 1) Wait for host + indexing (retry loop)
-          echo "Waiting for hostName + function indexing..."
-          HOST=""
+          # 1) Wait until at least 1 function is indexed
+          echo "Waiting for function indexing..."
           COUNT="0"
-
           for i in {1..18}; do
-            HOST=$(az functionapp show \
-              --name "$FUNCTION_APP" \
-              --resource-group "$RESOURCE_GROUP" \
-              --query "defaultHostName" -o tsv 2>/dev/null || true)
-
             COUNT=$(az functionapp function list \
               --name "$FUNCTION_APP" \
               --resource-group "$RESOURCE_GROUP" \
               --query "length(@)" -o tsv 2>/dev/null || echo "0")
 
-            HOST="$(echo "$HOST" | tr -d '\r\n')"
-            COUNT="$(echo "$COUNT" | tr -d '\r\n')"
-
-            echo "Attempt $i/18 -> host='$HOST' functions=$COUNT"
-
-            if [ -n "$HOST" ] && [ "$COUNT" != "0" ]; then
+            echo "Attempt $i/18 -> functions=$COUNT"
+            if [ "$COUNT" != "0" ]; then
               break
             fi
             sleep 10
           done
 
-          if [ -z "$HOST" ]; then
-            echo "❌ defaultHostName still empty after waiting."
-            echo "Dumping minimal functionapp show:"
-            az functionapp show --name "$FUNCTION_APP" --resource-group "$RESOURCE_GROUP" -o jsonc || true
-            exit 1
-          fi
-
           if [ "$COUNT" = "0" ]; then
-            echo "❌ No functions detected after deploy."
-            echo "Listing functions (raw):"
-            az functionapp function list --name "$FUNCTION_APP" --resource-group "$RESOURCE_GROUP" -o jsonc || true
+            echo "❌ No functions detected after waiting. Packaging/runtime issue."
             exit 1
           fi
 
-          echo ""
-          echo "✅ Host resolved: https://$HOST"
           echo "✅ Functions indexed: $COUNT"
           echo ""
 
-          # 2) Get a function key (because your app uses AuthLevel.FUNCTION)
-          # Try "default" first; fall back to any available key.
+          # 2) Resolve hostname via raw resource API (works even when az functionapp show doesn't expose it)
+          echo "Resolving hostname via Microsoft.Web/sites properties..."
+          HOST=$(az resource show \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$FUNCTION_APP" \
+            --resource-type "Microsoft.Web/sites" \
+            --query "properties.defaultHostName" -o tsv 2>/dev/null || true)
+
+          if [ -z "$HOST" ] || [ "$HOST" = "null" ]; then
+            HOST=$(az resource show \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$FUNCTION_APP" \
+              --resource-type "Microsoft.Web/sites" \
+              --query "properties.hostNames[0]" -o tsv 2>/dev/null || true)
+          fi
+
+          if [ -z "$HOST" ] || [ "$HOST" = "null" ]; then
+            echo "❌ Could not resolve hostname from resource properties."
+            echo "Dumping available hostnames (if any):"
+            az resource show \
+              --resource-group "$RESOURCE_GROUP" \
+              --name "$FUNCTION_APP" \
+              --resource-type "Microsoft.Web/sites" \
+              --query "properties.hostNames" -o jsonc || true
+            exit 1
+          fi
+
+          echo "✅ Host resolved: https://$HOST"
+          echo ""
+
+          # 3) Get a function key (AuthLevel.FUNCTION requires it)
           echo "Fetching function key..."
           KEY=$(az functionapp keys list \
             --name "$FUNCTION_APP" \
@@ -365,18 +372,18 @@ jobs:
           fi
 
           if [ -z "$KEY" ] || [ "$KEY" = "null" ]; then
-            echo "❌ Could not retrieve a function key. Check RBAC permissions for the service principal."
+            echo "❌ Could not retrieve a function key. RBAC missing for keys."
+            echo "Required role: 'Website Contributor' (or higher) on the Function App."
             exit 1
           fi
 
-          # 3) Call the route (your route is /api/http_trigger)
+          # 4) Call your route (note: your route is /api/http_trigger)
           URL="https://$HOST/api/http_trigger?name=smoke&code=$KEY"
           echo "Calling: $URL"
 
-          # Retry because cold start is common
           OK="false"
           for j in {1..10}; do
-            if curl -s -f --max-time 15 "$URL" >/tmp/resp.txt 2>/dev/null; then
+            if curl -s -f --max-time 20 "$URL" >/tmp/resp.txt 2>/dev/null; then
               OK="true"
               break
             fi
