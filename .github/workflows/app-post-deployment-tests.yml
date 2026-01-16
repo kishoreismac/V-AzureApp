@@ -1,30 +1,40 @@
 name: App Integration Tests (Development)
 
 on:
+  workflow_dispatch: {}
   workflow_run:
     workflows: ["Deploy to Development"]
     branches: [develop]
     types: [completed]
 
-  workflow_dispatch: {}
-
 permissions:
   contents: read
-  id-token: write
   actions: read
+  id-token: write
 
 concurrency:
   group: integration-dev
   cancel-in-progress: false
 
 jobs:
-  integration-dev:
+  post-deploy-integration-tests:
     name: Post-deploy Integration Tests (Dev)
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     environment: development
 
     steps:
+      - name: Gate - Only run when Deploy succeeded
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "Deploy workflow conclusion: ${{ github.event.workflow_run.conclusion }}"
+            if [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
+              echo "Skipping: Deploy did not succeed."
+              exit 1
+            fi
+          fi
+
       - name: Azure Login (Dev)
         uses: azure/login@v2
         with:
@@ -38,11 +48,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "=== READ INFRA CONTRACT (APP CONFIG) ==="
 
           APP_CONFIG_NAME="${{ vars.APP_CONFIG_NAME_DEV }}"
           if [ -z "$APP_CONFIG_NAME" ]; then
-            echo "❌ vars.APP_CONFIG_NAME_DEV is not set in the development environment."
+            echo "❌ vars.APP_CONFIG_NAME_DEV is not set."
             exit 1
           fi
 
@@ -52,9 +61,8 @@ jobs:
             --auth-mode login \
             --query "value" -o tsv 2>/dev/null || echo "NOT_FOUND")
 
-          echo "InfraPipeline:Status = $SIGNAL"
           if [ "$SIGNAL" != "COMPLETE" ]; then
-            echo "❌ Infra not ready. Expected InfraPipeline:Status=COMPLETE"
+            echo "❌ Infra not ready. InfraPipeline:Status=$SIGNAL"
             exit 1
           fi
 
@@ -70,42 +78,37 @@ jobs:
             --auth-mode login \
             --query "value" -o tsv)
 
-          if [ -z "$RESOURCE_GROUP" ] || [ -z "$FUNCTION_APP" ]; then
-            echo "❌ Missing ResourceGroupName / FunctionAppName in App Config."
-            exit 1
-          fi
-
-          echo "Resolved:"
-          echo "  Resource Group: $RESOURCE_GROUP"
-          echo "  Function App:   $FUNCTION_APP"
-
-          echo "APP_CONFIG=$APP_CONFIG_NAME" >> "$GITHUB_OUTPUT"
           echo "RESOURCE_GROUP=$RESOURCE_GROUP" >> "$GITHUB_OUTPUT"
           echo "FUNCTION_APP=$FUNCTION_APP" >> "$GITHUB_OUTPUT"
+          echo "APP_CONFIG=$APP_CONFIG_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve Hostname + Wait for Indexing
-        id: host
+      - name: Resolve Host + Function Count (robust)
+        id: resolve
         shell: bash
         run: |
           set -euo pipefail
-          echo "=== RESOLVE HOST + WAIT FOR INDEXING ==="
-
           RESOURCE_GROUP="${{ steps.infra.outputs.RESOURCE_GROUP }}"
           FUNCTION_APP="${{ steps.infra.outputs.FUNCTION_APP }}"
 
           echo "Resource Group: $RESOURCE_GROUP"
           echo "Function App:   $FUNCTION_APP"
-          echo ""
 
-          # 1) Wait until at least 1 function is indexed
+          # Resource ID is the safest anchor
+          RID=$(az functionapp show \
+            --name "$FUNCTION_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "id" -o tsv)
+
+          echo "RID=$RID"
+
+          # Wait for function indexing
           COUNT="0"
-          for i in {1..24}; do
+          for i in {1..18}; do
             COUNT=$(az functionapp function list \
               --name "$FUNCTION_APP" \
               --resource-group "$RESOURCE_GROUP" \
               --query "length(@)" -o tsv 2>/dev/null || echo "0")
-
-            echo "Attempt $i/24 -> functions=$COUNT"
+            echo "Attempt $i/18 -> functions=$COUNT"
             if [ "$COUNT" != "0" ]; then
               break
             fi
@@ -113,53 +116,41 @@ jobs:
           done
 
           if [ "$COUNT" = "0" ]; then
-            echo "❌ No functions indexed after waiting."
+            echo "❌ No functions indexed."
+            echo "COUNT=$COUNT" >> "$GITHUB_OUTPUT"
+            echo "HOST=" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
-          # 2) Resolve hostname (avoid az functionapp show, use resource properties)
-          HOST=$(az resource show \
-            --resource-group "$RESOURCE_GROUP" \
-            --name "$FUNCTION_APP" \
-            --resource-type "Microsoft.Web/sites" \
-            --query "properties.defaultHostName" -o tsv 2>/dev/null || true)
-
+          # Resolve host (do NOT handcraft ARM URLs)
+          HOST=$(az resource show --ids "$RID" --query "properties.defaultHostName" -o tsv 2>/dev/null || true)
           if [ -z "$HOST" ] || [ "$HOST" = "null" ]; then
-            HOST=$(az resource show \
-              --resource-group "$RESOURCE_GROUP" \
-              --name "$FUNCTION_APP" \
-              --resource-type "Microsoft.Web/sites" \
-              --query "properties.hostNames[0]" -o tsv 2>/dev/null || true)
+            HOST=$(az resource show --ids "$RID" --query "properties.hostNames[0]" -o tsv 2>/dev/null || true)
           fi
 
           if [ -z "$HOST" ] || [ "$HOST" = "null" ]; then
-            echo "❌ Hostname still not available from resource properties."
-            echo "Dumping hostNames:"
-            az resource show \
-              --resource-group "$RESOURCE_GROUP" \
-              --name "$FUNCTION_APP" \
-              --resource-type "Microsoft.Web/sites" \
-              --query "properties.hostNames" -o jsonc || true
+            echo "❌ Hostname not available yet."
+            echo "COUNT=$COUNT" >> "$GITHUB_OUTPUT"
+            echo "HOST=" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
-          echo "✅ Host: https://$HOST"
-          echo "✅ Functions indexed: $COUNT"
-
+          echo "✅ Host: $HOST"
+          echo "✅ Functions: $COUNT"
           echo "HOST=$HOST" >> "$GITHUB_OUTPUT"
-          echo "FUNCTION_COUNT=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "COUNT=$COUNT" >> "$GITHUB_OUTPUT"
 
-      - name: Get Function Key
-        id: key
+      - name: Run Integration Assertions (real HTTP)
+        id: it
         shell: bash
         run: |
           set -euo pipefail
-          echo "=== GET FUNCTION KEY ==="
 
           RESOURCE_GROUP="${{ steps.infra.outputs.RESOURCE_GROUP }}"
           FUNCTION_APP="${{ steps.infra.outputs.FUNCTION_APP }}"
+          HOST="${{ steps.resolve.outputs.HOST }}"
 
-          # Try default; fall back to any key
+          # Get function key (AuthLevel.FUNCTION)
           KEY=$(az functionapp keys list \
             --name "$FUNCTION_APP" \
             --resource-group "$RESOURCE_GROUP" \
@@ -173,39 +164,25 @@ jobs:
           fi
 
           if [ -z "$KEY" ] || [ "$KEY" = "null" ]; then
-            echo "❌ Could not retrieve a function key."
-            echo "RBAC required on the Function App: 'Website Contributor' (or higher)."
+            echo "❌ Cannot retrieve function key (RBAC missing)."
             exit 1
           fi
 
-          echo "✅ Key retrieved"
-          echo "KEY=$KEY" >> "$GITHUB_OUTPUT"
-
-      - name: Call Deployed Endpoint (Integration Test)
-        id: call
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "=== CALL DEPLOYED ENDPOINT ==="
-
-          HOST="${{ steps.host.outputs.HOST }}"
-          KEY="${{ steps.key.outputs.KEY }}"
-
-          URL="https://${HOST}/api/http_trigger?name=IntegrationTest&code=${KEY}"
+          URL="https://$HOST/api/http_trigger?name=IntegrationTest&code=$KEY"
           echo "Calling: $URL"
 
           OK="false"
-          for j in {1..12}; do
-            if curl -s -f --max-time 25 "$URL" >/tmp/resp.txt 2>/dev/null; then
+          for j in {1..10}; do
+            if curl -s -f --max-time 20 "$URL" >/tmp/resp.txt 2>/dev/null; then
               OK="true"
               break
             fi
-            echo "Attempt $j/12 -> not ready yet, retrying in 10s..."
-            sleep 10
+            echo "Attempt $j/10 -> not ready, retrying in 6s..."
+            sleep 6
           done
 
           if [ "$OK" != "true" ]; then
-            echo "❌ Integration call failed after retries."
+            echo "❌ Integration call failed."
             exit 1
           fi
 
@@ -213,47 +190,24 @@ jobs:
           cat /tmp/resp.txt
           echo ""
 
+          # Assertion: expected behavior
           if ! grep -q "Hello, IntegrationTest" /tmp/resp.txt; then
-            echo "❌ Unexpected response body (missing expected text)."
+            echo "❌ Integration assertion failed: expected greeting not found."
             exit 1
           fi
 
-          echo "✅ Integration test passed"
+          echo "✅ Integration assertions passed."
 
-      - name: Post-deploy Integration Test (Python HTTP)
-        shell: bash
-        run: |
-          set -euo pipefail
-          pip install requests
-
-          RESOURCE_GROUP="${{ needs.verify-prereqs-and-infra.outputs.resource_group }}"
-          FUNCTION_APP="${{ needs.verify-prereqs-and-infra.outputs.function_app }}"
-
-          HOST=$(az resource show \
-            --resource-group "$RESOURCE_GROUP" \
-            --name "$FUNCTION_APP" \
-            --resource-type "Microsoft.Web/sites" \
-            --query "properties.defaultHostName" -o tsv)
-
-          KEY=$(az functionapp keys list \
-            --name "$FUNCTION_APP" \
-            --resource-group "$RESOURCE_GROUP" \
-            --query "functionKeys.default" -o tsv)
-
-          export FUNCTION_URL="https://$HOST/api/http_trigger?name=IntegrationTest&code=$KEY"
-          python -m unittest integration/test_postdeploy_http.py
-
-
-      - name: Write Integration Status to App Configuration
+      - name: Write Status to App Config (always)
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          echo "=== WRITE STATUS TO APP CONFIG ==="
-
           APP_CONFIG="${{ steps.infra.outputs.APP_CONFIG }}"
-          HOST="${{ steps.host.outputs.HOST }}"
-          FUNCTION_COUNT="${{ steps.host.outputs.FUNCTION_COUNT }}"
+          HOST="${{ steps.resolve.outputs.HOST }}"
+          COUNT="${{ steps.resolve.outputs.COUNT }}"
+          RUN_ID="${{ github.run_id }}"
+          TS="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
           RESULT="${{ job.status }}"
           VALUE="${RESULT}_$(date -u +%Y%m%d_%H%M%S)"
@@ -263,10 +217,10 @@ jobs:
             --key "IntegrationTest:Development:Status" \
             --value "$VALUE" \
             --tags "environment=development" \
-                   "tested_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-                   "run_id=${{ github.run_id }}" \
-                   "host=${HOST}" \
-                   "function_count=${FUNCTION_COUNT}" \
+                   "tested_at=$TS" \
+                   "run_id=$RUN_ID" \
+                   "host=${HOST:-}" \
+                   "function_count=${COUNT:-0}" \
             --auth-mode login \
             --yes
 
