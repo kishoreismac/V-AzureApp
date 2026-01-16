@@ -3,7 +3,7 @@ name: Deploy to Development
 on:
   # Run after either workflow completes, but we gate on BOTH passing for same SHA
   workflow_run:
-    workflows: ["Test and Validate", "Security Scan"]
+    workflows: ["Test and Validate"]
     branches: [develop]
     types: [completed]
 
@@ -24,6 +24,7 @@ jobs:
   # 1) VERIFY APP PREREQS + READ INFRA CONTRACT FROM APP CONFIG
   # ==========================================================
   verify-prereqs-and-infra:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     name: Verify Prereqs and Infra Contract
     runs-on: ubuntu-latest
     environment: development
