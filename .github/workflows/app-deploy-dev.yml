@@ -10,7 +10,7 @@ on:
       - "host.json"
       - "requirements.txt"
       - "function_app.py"
-      - ".github/workflows/deploy-dev-app.yml"
+      - ".github/workflows/app-deploy-dev.yml"
 
   workflow_dispatch: {}
 
