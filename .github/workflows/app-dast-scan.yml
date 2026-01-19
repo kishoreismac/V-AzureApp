@@ -165,16 +165,34 @@ jobs:
           python3 - << 'PY'
           import json, sys, pathlib
 
-          p = pathlib.Path("zap-out/zap-report.json")
-          if not p.exists():
-            print("❌ Missing zap-report.json")
+          candidates = [
+            pathlib.Path("zap-out/zap-report.json"),
+            pathlib.Path("zap-out/zap_report.json"),
+            pathlib.Path("zap-out/report_json.json"),
+            pathlib.Path("zap-out/zap.json"),
+            pathlib.Path("zap-out/zap-report.jsonl"),
+          ]
+
+          found = None
+          for p in candidates:
+            if p.exists():
+              found = p
+              break
+
+          if not found:
+            print("❌ No ZAP JSON report found in zap-out/. موجود files:")
+            outdir = pathlib.Path("zap-out")
+            if outdir.exists():
+              for f in sorted(outdir.glob("*")):
+                print(" -", f.as_posix())
+            else:
+              print(" - zap-out/ directory missing")
             sys.exit(2)
 
-          data = json.loads(p.read_text(encoding="utf-8"))
+          print(f"✅ Using ZAP report: {found}")
 
-          # ZAP JSON structure from baseline:
-          # site[].alerts[] with riskcode: "0".."3"
-          # 3=High, 2=Medium, 1=Low, 0=Info
+          data = json.loads(found.read_text(encoding="utf-8"))
+
           highs = 0
           mediums = 0
 
@@ -188,13 +206,13 @@ jobs:
 
           print(f"ZAP summary: High={highs}, Medium={mediums}")
 
-          # Best-practice gate (adjust to your policy)
           if highs > 0:
             print("❌ DAST policy failed: High findings detected.")
             sys.exit(3)
 
           print("✅ DAST policy passed (no High findings).")
           PY
+
 
   # ==========================================================
   # 3) WRITE STATUS (NO REPEATS)
