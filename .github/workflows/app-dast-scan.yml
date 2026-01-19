@@ -221,7 +221,7 @@ jobs:
   write-status:
     name: Write DAST Status (App Config)
     runs-on: ubuntu-latest
-    needs: [resolve-target, dast]
+    needs: [resolve-target]
     if: always()
     environment: development
 
