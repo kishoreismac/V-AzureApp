@@ -1,0 +1,119 @@
+name: App Monitoring Validation (Development)
+
+on:
+  workflow_dispatch: {}
+  workflow_run:
+    workflows:
+      - App DAST Scan (Development)
+    types:
+      - completed
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  monitor-dev:
+    name: Validate Runtime Monitoring Signals
+    runs-on: ubuntu-latest
+    environment: development
+
+    steps:
+      # ------------------------------------
+      # Login
+      # ------------------------------------
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
+          audience: api://AzureADTokenExchange
+
+      # ------------------------------------
+      # Resolve App Insights dynamically
+      # ------------------------------------
+      - name: Resolve Application Insights
+        id: ai
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RG="${{ vars.RESOURCE_GROUP_DEV }}"
+
+          AI_NAME=$(az resource list \
+            --resource-group "$RG" \
+            --resource-type "Microsoft.Insights/components" \
+            --query "[0].name" -o tsv)
+
+          if [ -z "$AI_NAME" ]; then
+            echo "❌ Application Insights not found in RG"
+            exit 1
+          fi
+
+          APP_ID=$(az monitor app-insights component show \
+            --app "$AI_NAME" \
+            --resource-group "$RG" \
+            --query "appId" -o tsv)
+
+          echo "AI_NAME=$AI_NAME" >> $GITHUB_OUTPUT
+          echo "APP_ID=$APP_ID" >> $GITHUB_OUTPUT
+
+          echo "✅ Using App Insights: $AI_NAME"
+
+      # ------------------------------------
+      # Query Monitoring Signals
+      # ------------------------------------
+      - name: Validate Health Signals
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_ID="${{ steps.ai.outputs.APP_ID }}"
+
+          echo "=== Monitoring Health Check ==="
+
+          FAILURES=$(az monitor app-insights query \
+            --app "$APP_ID" \
+            --analytics-query "
+              requests
+              | where timestamp > ago(15m)
+              | summarize failures=countif(success == false)
+            " --query "tables[0].rows[0][0]" -o tsv)
+
+          EXCEPTIONS=$(az monitor app-insights query \
+            --app "$APP_ID" \
+            --analytics-query "
+              exceptions
+              | where timestamp > ago(15m)
+              | summarize count()
+            " --query "tables[0].rows[0][0]" -o tsv)
+
+          echo "Failures (15m):   $FAILURES"
+          echo "Exceptions (15m): $EXCEPTIONS"
+
+          if [ "$FAILURES" -gt 0 ] || [ "$EXCEPTIONS" -gt 0 ]; then
+            echo "❌ Monitoring validation failed"
+            exit 1
+          fi
+
+          echo "✅ Monitoring validation passed"
+
+      # ------------------------------------
+      # Persist Monitoring Status
+      # ------------------------------------
+      - name: Write Monitoring Status to App Config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az appconfig kv set \
+            --name "${{ vars.APP_CONFIG_NAME_DEV }}" \
+            --key "Monitoring:Development:Status" \
+            --value "HEALTHY_$(date -u +%Y%m%d_%H%M%S)" \
+            --tags "environment=development" \
+                   "checked_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --auth-mode login \
+            --yes
+
+          echo "✅ Monitoring status recorded"
