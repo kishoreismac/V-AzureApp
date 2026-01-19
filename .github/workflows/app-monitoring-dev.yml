@@ -42,7 +42,7 @@ jobs:
           # Read infra contract
 
           RG=$(az appconfig kv show \
-            --name "${{ vars.APP_CONFIG_NAME_DEV }}" \
+            -n "${{ vars.APP_CONFIG_NAME_DEV }}" \
             --key "InfraPipeline:ResourceGroupName" \
             --query "value" -o tsv)
 
