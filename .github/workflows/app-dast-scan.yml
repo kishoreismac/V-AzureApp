@@ -116,96 +116,97 @@ jobs:
   # ==========================================================
   # 2) DAST (OWASP ZAP BASELINE)
   # ==========================================================
-  dast:
-    name: DAST (OWASP ZAP Baseline) - Dev
-    runs-on: ubuntu-latest
-    needs: resolve-target
-    environment: development
 
-    steps:
-      - name: Run ZAP Baseline
+      - name: DAST (OWASP ZAP Baseline)
         shell: bash
         run: |
           set -euo pipefail
 
-          TARGET_URL="${{ needs.resolve-target.outputs.target_url }}"
-          echo "DAST target: $TARGET_URL"
+          HOST="v-sample-python-dev.azurewebsites.net"   # or resolve dynamically like your deploy workflow
+          RESOURCE_GROUP="rg-vsamplepython-dev"
+          FUNCTION_APP="v-sample-python-dev"
+
+          echo "Resolving function key..."
+          KEY=$(az functionapp keys list \
+            --name "$FUNCTION_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "functionKeys.default" -o tsv 2>/dev/null || true)
+
+          if [ -z "$KEY" ] || [ "$KEY" = "null" ]; then
+            KEY=$(az functionapp keys list \
+              --name "$FUNCTION_APP" \
+              --resource-group "$RESOURCE_GROUP" \
+              --query "functionKeys | values(@)[0]" -o tsv 2>/dev/null || true)
+          fi
+
+          if [ -z "$KEY" ] || [ "$KEY" = "null" ]; then
+            echo "❌ Could not retrieve function key (RBAC missing)."
+            exit 1
+          fi
+
+          DAST_TARGET="https://${HOST}/api/http_trigger?name=dast&code=${KEY}"
+          echo "DAST target: ${DAST_TARGET}"
 
           mkdir -p zap-out
+          chmod 777 zap-out
+
+          # Create a minimal automation plan that writes reports to a writable location
+          cat > zap.yaml <<EOF
+          env:
+            contexts:
+              - name: default
+                urls:
+                  - "https://${HOST}/"
+          jobs:
+            - type: spider
+              parameters:
+                url: "${DAST_TARGET}"
+                maxDuration: 2
+            - type: passiveScan-wait
+              parameters:
+                maxDuration: 240
+            - type: outputSummary
+              parameters:
+                format: LONG
+                summaryFile: "/home/zap/wrk/zap_out.json"
+            - type: report
+              parameters:
+                reportDir: "/home/zap/wrk"
+                reportFile: "zap-report.json"
+                template: "traditional-json"
+                reportTitle: "ZAP Scanning Report"
+          EOF
 
           docker run --rm \
-            -v "${PWD}/zap-out:/zap/wrk" \
+            -v "$PWD/zap.yaml:/home/zap/zap.yaml:ro" \
+            -v "$PWD/zap-out:/home/zap/wrk" \
             ghcr.io/zaproxy/zaproxy:stable \
-            zap-baseline.py \
-              -t "$TARGET_URL" \
-              -m 2 \
-              -T 240 \
-              -r zap-report.html \
-              -J zap-report.json \
-              -x zap-report.xml \
-              -I \
-              -d
+            zap.sh -cmd -autorun /home/zap/zap.yaml
 
-          echo "✅ ZAP completed (WARNs do not fail the step)."
+          echo "=== ZAP OUT DIR ==="
+          ls -la zap-out
 
-      - name: Upload DAST reports
-        uses: actions/upload-artifact@v4
-        with:
-          name: dast-dev-reports
-          path: zap-out
-          retention-days: 14
-
-      - name: Enforce policy (fail on High)
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # ZAP baseline exits non-zero for findings depending on config,
-          # so we enforce explicitly by parsing JSON.
+          echo "=== Parse report and enforce policy (fail only on High) ==="
           python3 - << 'PY'
           import json, sys, pathlib
-
-          candidates = [
-            pathlib.Path("zap-out/zap-report.json"),
-            pathlib.Path("zap-out/zap_report.json"),
-            pathlib.Path("zap-out/report_json.json"),
-            pathlib.Path("zap-out/zap.json"),
-            pathlib.Path("zap-out/zap-report.jsonl"),
-          ]
-
-          found = None
-          for p in candidates:
-            if p.exists():
-              found = p
-              break
-
-          if not found:
-            print("❌ No ZAP JSON report found in zap-out/. موجود files:")
-            outdir = pathlib.Path("zap-out")
-            if outdir.exists():
-              for f in sorted(outdir.glob("*")):
-                print(" -", f.as_posix())
-            else:
-              print(" - zap-out/ directory missing")
+          p = pathlib.Path("zap-out/zap-report.json")
+          if not p.exists():
+            print("❌ Missing zap-report.json. Found:")
+            for f in sorted(pathlib.Path("zap-out").glob("*")):
+              print(" -", f.name)
             sys.exit(2)
 
-          print(f"✅ Using ZAP report: {found}")
-
-          data = json.loads(found.read_text(encoding="utf-8"))
-
+          data = json.loads(p.read_text(encoding="utf-8"))
           highs = 0
           mediums = 0
 
           for site in data.get("site", []):
             for a in site.get("alerts", []):
               rc = str(a.get("riskcode", "0"))
-              if rc == "3":
-                highs += 1
-              elif rc == "2":
-                mediums += 1
+              if rc == "3": highs += 1
+              elif rc == "2": mediums += 1
 
           print(f"ZAP summary: High={highs}, Medium={mediums}")
-
           if highs > 0:
             print("❌ DAST policy failed: High findings detected.")
             sys.exit(3)
