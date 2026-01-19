@@ -43,7 +43,7 @@ jobs:
 
           RG=$(az appconfig kv show \
             --name "${{ vars.APP_CONFIG_NAME_DEV }}" \
-            --key "InfraPipeline:ResourceGroup" \
+            --key "InfraPipeline:ResourceGroupName" \
             --query "value" -o tsv)
 
           # Discover App Insights
