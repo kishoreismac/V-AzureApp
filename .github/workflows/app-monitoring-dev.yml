@@ -39,17 +39,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          RG="${{ vars.RESOURCE_GROUP_DEV }}"
+          # Read infra contract
 
-          AI_NAME=$(az resource list \
-            --resource-group "$RG" \
-            --resource-type "Microsoft.Insights/components" \
-            --query "[0].name" -o tsv)
-
-          if [ -z "$AI_NAME" ]; then
-            echo "❌ Application Insights not found in RG"
-            exit 1
-          fi
+          # Discover App Insights
+          AI_NAME= "${{ vars.APP_CONFIG_NAME_DEV}}"
 
           APP_ID=$(az monitor app-insights component show \
             --app "$AI_NAME" \
