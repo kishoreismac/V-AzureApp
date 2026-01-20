@@ -1,0 +1,421 @@
+name: App Deploy (Env)
+
+on:
+  # Auto deploy DEV when PR into develop is merged
+  pull_request:
+    branches: ["develop"]
+    types: [closed]
+    paths:
+      - "*.py"
+      - "host.json"
+      - "requirements.txt"
+      - "function_app.py"
+      - ".github/workflows/app-deploy.yml"
+
+  # Manual deploy for any env
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, staging, production]
+      sha:
+        description: "Optional SHA to deploy (defaults to current)"
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: app-deploy-${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  # ==========================================================
+  # 1) VERIFY PREREQS + READ INFRA CONTRACT FROM APP CONFIG
+  # ==========================================================
+  verify-prereqs-and-infra:
+    name: Verify Prereqs and Infra Contract
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+
+    outputs:
+      deploy_sha: ${{ steps.sha.outputs.SHA }}
+      deploy_env: ${{ steps.env.outputs.ENV }}
+      resource_group: ${{ steps.infra.outputs.RESOURCE_GROUP }}
+      function_app: ${{ steps.infra.outputs.FUNCTION_APP }}
+      app_config: ${{ steps.infra.outputs.APP_CONFIG }}
+
+    steps:
+      - name: Resolve target environment
+        id: env
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "ENV=dev" >> "$GITHUB_OUTPUT"
+          else
+            echo "ENV=${{ inputs.environment }}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Target ENV: $(cat $GITHUB_OUTPUT | cut -d= -f2)"
+
+      - name: Ensure PR was merged (for pull_request trigger)
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.pull_request.merged }}" != "true" ]; then
+            echo "ℹ️ PR was closed but not merged. Skipping deploy."
+            exit 1
+          fi
+
+      - name: Determine SHA to deploy
+        id: sha
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "SHA=${{ github.event.pull_request.merge_commit_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            if [ -n "${{ inputs.sha }}" ]; then
+              echo "SHA=${{ inputs.sha }}" >> "$GITHUB_OUTPUT"
+            else
+              echo "SHA=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+          echo "Deploy SHA: ${{ steps.sha.outputs.SHA }}"
+
+      # For PR trigger, enforce only develop branch
+      - name: Only deploy from develop (PR trigger)
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.base_ref }}" != "develop" ]; then
+            echo "❌ Base ref is not develop. base_ref=${{ github.base_ref }}"
+            exit 1
+          fi
+
+      # DEV prereqs enforcement only (because your tests/security are on develop)
+      - name: Verify required workflows succeeded for this SHA (DEV only)
+        if: ${{ steps.env.outputs.ENV == 'dev' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.sha.outputs.SHA }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Verifying workflow success for SHA: $SHA"
+
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y jq >/dev/null
+
+          RUNS=$(gh api -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/actions/runs?branch=develop&per_page=100")
+
+          TEST_OK=$(echo "$RUNS" | jq -r --arg sha "$SHA" '
+            [.workflow_runs[]
+              | select(.head_sha == $sha)
+              | select(.name == "Test and Validate")
+              | .conclusion][0] // "missing"
+          ')
+
+          SEC_OK=$(echo "$RUNS" | jq -r --arg sha "$SHA" '
+            [.workflow_runs[]
+              | select(.head_sha == $sha)
+              | select(.name == "Security Scan")
+              | .conclusion][0] // "missing"
+          ')
+
+          echo "Test and Validate conclusion: $TEST_OK"
+          echo "Security Scan conclusion:      $SEC_OK"
+
+          if [ "$TEST_OK" != "success" ] || [ "$SEC_OK" != "success" ]; then
+            echo "❌ Prerequisites not met for SHA $SHA"
+            exit 1
+          fi
+
+          echo "✅ DEV prereqs satisfied (tests + security)"
+
+      - name: Azure Login (target env)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          audience: api://AzureADTokenExchange
+
+      - name: Read Infra Contract from App Configuration
+        id: infra
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_CONFIG_NAME="${{ vars.APP_CONFIG_NAME }}"
+          if [ -z "$APP_CONFIG_NAME" ]; then
+            echo "❌ vars.APP_CONFIG_NAME is not set for environment '${{ steps.env.outputs.ENV }}'."
+            exit 1
+          fi
+
+          SIGNAL=$(az appconfig kv show \
+            --name "$APP_CONFIG_NAME" \
+            --key "InfraPipeline:Status" \
+            --auth-mode login \
+            --query "value" -o tsv 2>/dev/null || echo "NOT_FOUND")
+
+          echo "InfraPipeline:Status = $SIGNAL"
+          if [ "$SIGNAL" != "COMPLETE" ]; then
+            echo "❌ Infrastructure not ready. Expected InfraPipeline:Status=COMPLETE"
+            exit 1
+          fi
+
+          RESOURCE_GROUP=$(az appconfig kv show \
+            --name "$APP_CONFIG_NAME" \
+            --key "InfraPipeline:ResourceGroupName" \
+            --auth-mode login \
+            --query "value" -o tsv)
+
+          FUNCTION_APP=$(az appconfig kv show \
+            --name "$APP_CONFIG_NAME" \
+            --key "InfraPipeline:FunctionAppName" \
+            --auth-mode login \
+            --query "value" -o tsv)
+
+          if [ -z "$RESOURCE_GROUP" ] || [ -z "$FUNCTION_APP" ]; then
+            echo "❌ Infra contract values missing in App Config."
+            exit 1
+          fi
+
+          echo "RESOURCE_GROUP=$RESOURCE_GROUP" >> "$GITHUB_OUTPUT"
+          echo "FUNCTION_APP=$FUNCTION_APP" >> "$GITHUB_OUTPUT"
+          echo "APP_CONFIG=$APP_CONFIG_NAME" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved:"
+          echo "  Env:           ${{ steps.env.outputs.ENV }}"
+          echo "  App Config:    $APP_CONFIG_NAME"
+          echo "  ResourceGroup: $RESOURCE_GROUP"
+          echo "  FunctionApp:   $FUNCTION_APP"
+
+  # ===========================
+  # 2) BUILD ZIP PACKAGE
+  # ===========================
+  build-package:
+    name: Build Package
+    runs-on: ubuntu-latest
+    needs: verify-prereqs-and-infra
+
+    steps:
+      - name: Checkout code (exact SHA)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-prereqs-and-infra.outputs.deploy_sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Build Azure Functions ZIP package (Python v2 layout)
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEPLOY_DIR="deploy-${{ needs.verify-prereqs-and-infra.outputs.deploy_env }}"
+          rm -rf "$DEPLOY_DIR"
+          mkdir -p "$DEPLOY_DIR"
+
+          cp host.json "$DEPLOY_DIR/" 2>/dev/null || (echo "❌ host.json missing at repo root" && exit 1)
+          cp requirements.txt "$DEPLOY_DIR/" 2>/dev/null || echo "No requirements.txt found"
+
+          if [ -f "function_app.py" ]; then
+            cp function_app.py "$DEPLOY_DIR/function_app.py"
+          else
+            echo "❌ Expected function_app.py at repo root not found."
+            exit 1
+          fi
+
+          cat > "$DEPLOY_DIR/.funcignore" << 'EOF'
+          __pycache__
+          .python_packages
+          .venv
+          local.settings.json
+          .git
+          .github
+          tests
+          *.pem
+          *.dev.json
+          config.*.json
+          EOF
+
+          ZIP="function-app-${{ needs.verify-prereqs-and-infra.outputs.deploy_env }}.zip"
+          (cd "$DEPLOY_DIR" && zip -r "../$ZIP" . >/dev/null)
+
+          echo "✅ Created $ZIP"
+          unzip -l "$ZIP" | head -n 60
+
+      - name: Upload Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: function-app-package
+          path: function-app-*.zip
+          retention-days: 7
+
+  # ===========================
+  # 3) DEPLOY + SMOKE TESTS
+  # ===========================
+  deploy:
+    name: Deploy + Smoke Tests
+    runs-on: ubuntu-latest
+    needs: [verify-prereqs-and-infra, build-package]
+    environment: ${{ needs.verify-prereqs-and-infra.outputs.deploy_env }}
+
+    steps:
+      - name: Download Package
+        uses: actions/download-artifact@v4
+        with:
+          name: function-app-package
+
+      - name: Azure Login (target env)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          audience: api://AzureADTokenExchange
+
+      - name: Deploy ZIP to Function App
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ENV="${{ needs.verify-prereqs-and-infra.outputs.deploy_env }}"
+          RG="${{ needs.verify-prereqs-and-infra.outputs.resource_group }}"
+          APP="${{ needs.verify-prereqs-and-infra.outputs.function_app }}"
+          ZIP="function-app-$ENV.zip"
+
+          echo "Deploying:"
+          echo "  Env: $ENV"
+          echo "  RG:  $RG"
+          echo "  App: $APP"
+          echo "  Zip: $ZIP"
+
+          az functionapp deployment source config-zip \
+            --resource-group "$RG" \
+            --name "$APP" \
+            --src "$ZIP"
+
+          echo "✅ Deployment initiated"
+
+      - name: Smoke Test (resolve host + list functions + call endpoint)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RG="${{ needs.verify-prereqs-and-infra.outputs.resource_group }}"
+          APP="${{ needs.verify-prereqs-and-infra.outputs.function_app }}"
+
+          echo "Waiting for function indexing..."
+          COUNT="0"
+          for i in {1..18}; do
+            COUNT=$(az functionapp function list \
+              --name "$APP" \
+              --resource-group "$RG" \
+              --query "length(@)" -o tsv 2>/dev/null || echo "0")
+
+            echo "Attempt $i/18 -> functions=$COUNT"
+            if [ "$COUNT" != "0" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          if [ "$COUNT" = "0" ]; then
+            echo "❌ No functions detected after waiting."
+            exit 1
+          fi
+
+          HOST=$(az resource show \
+            --resource-group "$RG" \
+            --name "$APP" \
+            --resource-type "Microsoft.Web/sites" \
+            --query "properties.defaultHostName" -o tsv 2>/dev/null || true)
+
+          if [ -z "$HOST" ] || [ "$HOST" = "null" ]; then
+            echo "❌ Could not resolve hostname."
+            exit 2
+          fi
+
+          KEY=$(az functionapp keys list \
+            --name "$APP" \
+            --resource-group "$RG" \
+            --query "functionKeys.default" -o tsv 2>/dev/null || true)
+
+          if [ -z "$KEY" ] || [ "$KEY" = "null" ]; then
+            echo "❌ Could not retrieve function key."
+            exit 3
+          fi
+
+          URL="https://$HOST/api/http_trigger?name=smoke&code=$KEY"
+          echo "Calling: $URL"
+
+          for j in {1..10}; do
+            if curl -s -f --max-time 20 "$URL" >/tmp/resp.txt 2>/dev/null; then
+              echo "✅ Smoke response:"
+              cat /tmp/resp.txt
+              exit 0
+            fi
+            echo "Attempt $j/10 -> retrying in 6s..."
+            sleep 6
+          done
+
+          echo "❌ Smoke call failed after retries."
+          exit 4
+
+  # ===========================
+  # 4) UPDATE STATUS
+  # ===========================
+  update-status:
+    name: Update Deployment Status (App Config)
+    runs-on: ubuntu-latest
+    needs: [verify-prereqs-and-infra, deploy]
+    if: ${{ needs.deploy.result == 'success' }}
+    environment: ${{ needs.verify-prereqs-and-infra.outputs.deploy_env }}
+
+    steps:
+      - name: Azure Login (target env)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          audience: api://AzureADTokenExchange
+
+      - name: Write AppDeployment status to App Config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ENV="${{ needs.verify-prereqs-and-infra.outputs.deploy_env }}"
+          APP_CONFIG="${{ needs.verify-prereqs-and-infra.outputs.app_config }}"
+          SHA="${{ needs.verify-prereqs-and-infra.outputs.deploy_sha }}"
+
+          KEY="AppDeployment:${ENV^}:Status"
+          VAL="DEPLOYED_$(date -u +%Y%m%d_%H%M%S)"
+
+          az appconfig kv set \
+            --name "$APP_CONFIG" \
+            --key "$KEY" \
+            --value "$VAL" \
+            --tags "environment=$ENV" \
+                   "deployed_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+                   "run_id=${{ github.run_id }}" \
+                   "commit=$SHA" \
+            --auth-mode login \
+            --yes
+
+          echo "✅ $KEY = $VAL"
