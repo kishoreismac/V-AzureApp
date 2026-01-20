@@ -1,10 +1,8 @@
 name: App Deploy (Env)
 
 on:
-  # Auto deploy DEV when PR into develop is merged
-  pull_request:
+  push:
     branches: ["develop"]
-    types: [closed]
     paths:
       - "*.py"
       - "host.json"
@@ -12,7 +10,6 @@ on:
       - "function_app.py"
       - ".github/workflows/app-deploy.yml"
 
-  # Manual deploy for any env
   workflow_dispatch:
     inputs:
       environment:
@@ -23,6 +20,7 @@ on:
       sha:
         description: "Optional SHA to deploy (defaults to current)"
         required: false
+
 
 permissions:
   contents: read
@@ -62,15 +60,6 @@ jobs:
           fi
           echo "Target ENV: $(cat $GITHUB_OUTPUT | cut -d= -f2)"
 
-      - name: Ensure PR was merged (for pull_request trigger)
-        if: ${{ github.event_name == 'pull_request' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event.pull_request.merged }}" != "true" ]; then
-            echo "ℹ️ PR was closed but not merged. Skipping deploy."
-            exit 1
-          fi
 
       - name: Determine SHA to deploy
         id: sha
@@ -78,28 +67,31 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "SHA=${{ github.event.pull_request.merge_commit_sha }}" >> "$GITHUB_OUTPUT"
-          else
-            if [ -n "${{ inputs.sha }}" ]; then
-              echo "SHA=${{ inputs.sha }}" >> "$GITHUB_OUTPUT"
-            else
-              echo "SHA=${{ github.sha }}" >> "$GITHUB_OUTPUT"
-            fi
+          # Default: deploy the commit that triggered the workflow
+          SHA="${{ github.sha }}"
+          REF="${{ github.ref_name }}"
+
+          # Optional: allow manual override when using workflow_dispatch
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.sha }}" ]; then
+            SHA="${{ inputs.sha }}"
+            # REF remains the branch you ran it from (github.ref_name)
           fi
 
-          echo "Deploy SHA: ${{ steps.sha.outputs.SHA }}"
+          echo "SHA=$SHA" >> "$GITHUB_OUTPUT"
+          echo "REF=$REF" >> "$GITHUB_OUTPUT"
 
-      # For PR trigger, enforce only develop branch
-      - name: Only deploy from develop (PR trigger)
-        if: ${{ github.event_name == 'pull_request' }}
+          echo "Deploying SHA=$SHA from REF=$REF"
+
+
+      - name: Only deploy from develop
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ github.base_ref }}" != "develop" ]; then
-            echo "❌ Base ref is not develop. base_ref=${{ github.base_ref }}"
+          if [ "${{ steps.sha.outputs.REF }}" != "develop" ]; then
+            echo "❌ Not on develop branch. Ref is: ${{ steps.sha.outputs.REF }}"
             exit 1
           fi
+
 
       # DEV prereqs enforcement only (because your tests/security are on develop)
       - name: Verify required workflows succeeded for this SHA (DEV only)
